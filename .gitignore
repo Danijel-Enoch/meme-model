@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+
+# cached API responses
+.cache/
+
+# fitted models and fetched market data
+model.json
+*.model.json
+sample.csv
+candles.csv
+*.candles.csv
+
+# secrets
+.env
+.env.*
+*.pem
+*.key
+
+# build output
+dist/
+build/
+*.tsbuildinfo
+
+# os / editor
+.DS_Store
+*.log
