@@ -1,120 +1,128 @@
 # meme-hmm
 
-A hidden Markov model for meme coin regimes, in TypeScript on Bun. No dependencies —
-the forward-backward, Baum-Welch, and Viterbi recursions are written out directly.
+Hidden Markov and hidden semi-Markov models over crypto price regimes, in
+TypeScript on Bun. Zero runtime dependencies — forward-backward, Baum-Welch,
+Viterbi and the segmental EM recursions are written out directly.
 
-The premise: a meme coin is not one process. It is a few very different processes
-that take turns — a low-volatility chop that dominates the sample, a slow bleed, and
-a rare, violent, short-lived pump. You never observe which one is running. An HMM
-treats that regime as a hidden state, infers a probability distribution over it from
+The premise: a token is not one process. It is a few very different processes
+taking turns — a low-volatility chop that dominates the sample, a slow bleed,
+and a rare, violent, short-lived pump. You never observe which one is running.
+An HMM treats that regime as a hidden state, infers a distribution over it from
 price and volume, and forecasts which regime comes next.
+
+It works on DEX meme coins and on Hyperliquid perps. **It has not produced a
+tradeable edge on either**, and the more interesting half of this repo is the
+machinery that establishes that rather than hiding it. See [Results](#results).
 
 ## Quick start
 
 ```bash
 bun install
-bun run demo                              # synthetic end-to-end walkthrough
-bun test                                  # 83 tests, incl. brute-force validation
+bun run demo      # synthetic end-to-end walkthrough
+bun test          # 96 tests, incl. brute-force validation of both models
 ```
 
-Against live market data — free, no API key, nothing to sign up for:
+Hyperliquid perps — clean data, 4.5bps taker, no API key:
 
 ```bash
-bun run src/cli.ts trending --network solana      # what is moving right now
-bun run src/cli.ts search   --token WIF           # find the deepest real pool
-bun run src/cli.ts backtest --token WIF           # fetch + walk-forward test
+bun run src/cli.ts top --source hyperliquid                  # top perps by volume
+bun run src/cli.ts ceiling    --coin SOL --cost 4.5          # is money there to find?
+bun run src/cli.ts confluence --coin SOL --cost 4.5 --timeframe 1h
+bun run src/cli.ts validate   --coin SOL --cost 4.5          # skill, or just exposure?
+bun run src/cli.ts account    --coin SOL --equity 50 --leverage 2 --days 14
+```
+
+DEX pools via GeckoTerminal + DexScreener, also free and keyless:
+
+```bash
+bun run src/cli.ts top      --networks solana,base   # screened for modelability
+bun run src/cli.ts search   --token WIF              # find the deepest real pool
+bun run src/cli.ts backtest --token WIF              # fetch + walk-forward
+bun run src/cli.ts trades   --token WIF              # ledger + ROI by window
 bun run src/cli.ts train    --token WIF --out wif.json
-bun run src/cli.ts predict  --model wif.json      # reloads the pool it was trained on
-bun run src/cli.ts validate --token WIF           # is it skill, or just exposure?
-bun run src/cli.ts ceiling  --token WIF           # is there money here to find?
-bun run src/cli.ts fetch    --token WIF --out wif.csv   # or just grab the candles
+bun run src/cli.ts predict  --model wif.json         # reloads its own source
 ```
 
-Or bring your own CSV — only a `close`/`price` column is required, header names
-are matched loosely, so exchange and aggregator exports usually load unedited:
+Or bring a CSV — only a `close`/`price` column is required, and headers are
+matched loosely, so exchange and aggregator exports usually load unedited:
 
 ```bash
-bun run src/cli.ts backtest --csv wif.csv
+bun run src/cli.ts fetch --coin BTC --out btc.csv
+bun run src/cli.ts backtest --csv btc.csv
 ```
 
 ## Data sources
 
 | source | used for | limits |
 | --- | --- | --- |
-| [Hyperliquid](https://api.hyperliquid.xyz) | perp OHLCV + market list. Continuous order book, so no gaps | ~5000 bars/request |
+| [Hyperliquid](https://api.hyperliquid.xyz) | perp candles, funding, market list. Continuous order book, so no gaps | ~5000 bars/request |
 | [GeckoTerminal](https://api.geckoterminal.com) | DEX OHLCV history | 1000 bars/request, ~30 req/min |
 | [DexScreener](https://api.dexscreener.com) | pool discovery, live liquidity and volume | no candle endpoint |
 
-Hyperliquid is the cleaner venue by a distance, and it was used to falsify the
-main hypothesis this project had been carrying — see Results.
+Responses cache to `.cache/` for 10 minutes (`--no-cache` to bypass) and requests
+are throttled with backoff, so re-running a backtest is free.
 
-```bash
-bun run src/cli.ts top --source hyperliquid          # top perps by 24h volume
-bun run src/cli.ts ceiling  --coin BTC --cost 4.5    # 4.5bps = HL base taker
-bun run src/cli.ts confluence --coin SOL --cost 4.5 --timeframe 1h
-```
+### Five things about this data that bite
 
-Responses are cached to `.cache/` for 10 minutes (`--no-cache` to bypass), and
-requests are throttled with backoff, so re-running a backtest costs nothing.
+**`before_timestamp` is inclusive** (GeckoTerminal). Paging backwards re-serves
+the boundary bar; un-deduped that injects a fake zero return every 1000 bars.
 
-Four things about this data bite if you do not handle them, and all four are
-handled in `src/sources.ts`:
-
-**`before_timestamp` is inclusive.** Paging backwards re-serves the boundary bar.
-Un-deduped, that injects a fake zero return at every 1000-bar boundary.
+**`fundingHistory` returns the *first* ~500 hours after `startTime`**, not the
+most recent 500 (Hyperliquid). Asking for 60 days back silently returns data
+from 60–39 days ago and leaves your evaluation window uncovered — which showed
+up as exactly `$0.00` funding across every coin. `fetchFunding` pages forward.
 
 **A bare ticker does not find the token.** DexScreener search is a literal text
-match, and dogwifhat's symbol is `$WIF` — querying `WIF` returns seven
-impersonators and not the real one. Short queries are tried in several spellings
-and merged.
+match and dogwifhat's symbol is `$WIF`, so querying `WIF` returns seven
+impersonators and not the real one. Short queries are tried in several spellings.
 
 **Ranking by liquidity picks dead pools.** The deepest `$WIF` pool holds $59M and
-trades $0 a day; its candle series is almost entirely gaps. Pools are ranked by
-the geometric mean of liquidity and 24h volume, with a floor under both. Ranking
-by volume alone rewards wash-traded shells with no depth — you need both.
+trades $0 a day; its candles are almost entirely gaps. Pools rank by the
+geometric mean of liquidity and volume, with a floor under both — volume alone
+rewards wash-traded shells with no depth. The worst offender seen had $106M of
+daily volume against $0.0000016 of liquidity.
 
-**Missing bars are invisible.** Untraded intervals are omitted from the response
-rather than returned as zero-volume bars, so a "5m bar" can silently span three
-hours. That breaks the fixed-time-step assumption the Markov chain rests on. The
-fetcher counts gaps and warns; `--fill` inserts flat zero-volume bars for short
-runs, and deliberately refuses to fill long ones — hours of synthetic flat bars
-would fabricate a low-volatility regime that never existed.
+**Missing bars are invisible.** Untraded intervals are omitted rather than
+returned as zero-volume bars, so a "5m bar" can silently span three hours,
+breaking the fixed-time-step assumption the Markov chain rests on. The fetcher
+counts gaps and warns; `--fill` inserts flat zero-volume bars for short runs and
+deliberately refuses long ones, since hours of synthetic flat bars would
+fabricate a low-volatility regime that never existed.
 
-On live `$WIF/SOL`, a $5.5M pool, 5m bars are 26% missing while 1h bars are 0.6%
-missing. Timeframe choice is mostly a data-quality decision.
+Concretely: `$WIF/SOL`, a $5.5M pool, is **26% missing at 5m and 0.6% at 1h**.
+Hyperliquid perps are **0% missing at every interval**. Timeframe and venue
+choice are mostly data-quality decisions.
 
 ## The models
 
 Two, selected with `--model-type` (or `--hsmm`).
 
-**HMM** (default) — state `z_t` follows a Markov chain, features are Gaussian
-given the state:
+**HMM** (default) — state follows a Markov chain, features are Gaussian given
+the state:
 
 ```
 z_t | z_{t-1} ~ Categorical(A[z_{t-1}])
 x_t | z_t     ~ N(mu[z_t], diag(var[z_t]))
 ```
 
-**HSMM** — a hidden semi-Markov model. Each state carries its own learned
-duration distribution `p_j(d)`, and self-transitions are forbidden because dwell
-time is the duration model's job.
+**HSMM** — hidden semi-Markov. Each state learns its own duration distribution
+`p_j(d)`; self-transitions are forbidden because dwell time is the duration
+model's job.
 
 This is not a refinement, it fixes a specific failure. A plain HMM forces
 *geometric* dwell times, so the hazard of leaving a regime is constant no matter
-how long you have been in it. That caps how confident the one-step-ahead
-forecast can ever be at roughly the transition diagonal. Measured on regimes
-that always last exactly 8 bars, asking each model for P(switch) on the true
-final bar of a run:
+how long you have been in it — which caps how confident the one-step-ahead
+forecast can ever be at roughly the transition diagonal. On regimes that always
+last exactly 8 bars, asking each model for P(switch) on the true final bar:
 
 ```
 HSMM 0.998        HMM 0.129
 ```
 
-The HSMM can say "this regime is 8 bars old and they last 8 bars, so it ends
-now." The HMM structurally cannot. That single difference is worth more than
-everything else in this repo — see the results below.
+The HSMM can say "this regime is 8 bars old and they last 8, so it ends now."
+The HMM structurally cannot.
 
-Three features, all known at the close of the bar they describe:
+### Features
 
 | feature | why |
 | --- | --- |
@@ -125,39 +133,43 @@ Three features, all known at the close of the bar they describe:
 `--window` defaults to **5**, not 20. A window longer than a regime cannot see
 that regime, and these regimes are short: on synthetic data with 4.5-bar pumps,
 20 → 3 lifted Viterbi regime recovery from 53% to 73%. On that same data,
-dropping the two engineered features entirely and fitting on returns alone
-reached 86% — they lag through exactly the transitions that matter. They are
-still on by default because that result comes from data built to match the
-model's assumptions; measure on your own series with `--no-vol --no-volume`
-before trusting it.
+dropping both engineered features and fitting on returns alone reached 86% —
+they lag through exactly the transitions that matter. They stay on by default
+because that result comes from data built to match the model's assumptions;
+measure on your own series with `--no-vol --no-volume` before trusting it.
 
-## Trading it, and the two ways that goes wrong
+## Not fooling yourself
 
-**Use filtered states, never smoothed ones.** `posteriors()` gives
-`P(z_t | x_1..T)` — it uses the whole series, including bars after `t`, to decide
-what state you were in at `t`. It is the right quantity for fitting and produces
-gorgeous, entirely fictional backtests. `filter()` gives `P(z_t | x_1..t)`, which is
-what you would actually have known at the time. The backtest uses `filter()` only,
-and a test asserts that truncating the series leaves earlier beliefs bit-identical.
+Three separate mistakes will each manufacture a beautiful equity curve. All
+three are guarded, and each guard has a test that fails loudly if it regresses.
 
-**Refit only on the past.** `walkForward()` trains on a trailing block, freezes the
-parameters, trades the next block, then rolls forward. The feature scaler is fit on
-training rows too — standardizing over the full series leaks the future through the
-mean and standard deviation. A test tampers with late candles and asserts that early
-positions do not move.
+**Filtered states, never smoothed.** `posteriors()` gives `P(z_t | x_1..T)` — it
+uses bars after `t` to decide what state you were in at `t`. Right for fitting,
+fiction for trading. The backtest only calls `filter()`, and a test asserts that
+truncating the series leaves earlier beliefs bit-identical.
 
-The signal is the expected next-bar return under the one-step-ahead state forecast:
+**Refit only on the past.** `walkForward()` trains on a trailing block, freezes
+the parameters, trades the next block, rolls forward. The feature scaler is fit
+on training rows too — standardizing over the full series leaks the future
+through the mean and standard deviation. A test tampers with late candles and
+asserts early positions do not move.
 
-```
-E[r_{t+1} | x_1..t] = sum_k P(z_{t+1} = k | x_1..t) * mu_return[k]
-```
+**Higher timeframes are not complete yet.** At 10:05 the 10:00–11:00 hourly bar
+does not exist. Reading it at every 5m step is reading tomorrow's newspaper.
+Every multi-timeframe alignment goes through `lastCompletedIndex`, and a test
+corrupts *all* future base candles and asserts every earlier signal is identical.
 
-Go long when that clears the entry threshold, which **defaults to twice the per-side
-cost**. Taking a signal whose expected edge is smaller than the cost of expressing it
-is the fastest way to bleed out, and it is the default failure of this entire genre
-of model.
+### The entry threshold
 
-## Top-down confluence (`confluence`)
+Naively, go long when expected next-bar return clears the cost. That is a
+category error: a regime model holds for the regime's duration, so the profit of
+entering is roughly `E[return per bar] × E[bars held] − round trip`. Testing the
+per-bar figure against the full round trip silently produces **zero trades** —
+5bps a bar never clears 9bps, but 5bps across 10 bars clears it comfortably.
+`--duration-aware` spreads the round trip across the expected hold, using the
+state durations the model already estimates.
+
+## Top-down confluence
 
 One model per timeframe, combined into a scalping stack:
 
@@ -167,58 +179,53 @@ SETUP   15m  does the intermediate agree?       gate only
 TRIGGER 5m   enter here                         fires the entry
 ```
 
-All three must agree to open. Only the bias has to break to close — a scalp
-should be abandoned the moment the structure justifying it fails.
+All three must agree to open; only the bias has to break to close, because a
+scalp should be abandoned the moment the structure justifying it fails.
 
-**The lookahead trap.** At 10:05 the 10:00–11:00 hourly bar does not exist yet.
-Backtests that read the "current" higher-timeframe bar at every 5m step are
-reading tomorrow's newspaper, and they produce beautiful equity curves. Every
-alignment here goes through `lastCompletedIndex`, and a test corrupts all future
-base candles and asserts that every earlier signal is bit-identical.
-
-**What it is actually for.** Not prediction — turnover. A single 5m model fires
+**What it is actually for: turnover, not prediction.** A single 5m model fires
 600+ trades and cannot survive a 30bps round trip, so at realistic cost it takes
-*zero* trades. Demanding three-way agreement cuts that to 7–25 trades, which is
-what makes trading at real fees possible at all. Measured across 9 live tokens:
+*zero* trades. Three-way agreement cuts that to 7–25, which is what makes
+trading at real fees possible at all.
 
-| | trades | mean ROI @30bps |
-| --- | --- | --- |
-| single 5m | 0 | 0.0% |
-| 3TF confluence | 7–25 | +42.6% |
-| buy & hold | — | **+73.0%** |
-
-It trades, and it underperforms holding. It beat buy & hold on 2 of 9 tokens,
-both in downtrends, where the gain came from being flat rather than from timing.
-
-## Two diagnostics that decide whether any of this is real
+## Two diagnostics
 
 These matter more than the backtest. Both were added after a result that looked
 excellent turned out to be nothing.
 
 **`validate`** — reruns the strategy's own positions against a null that keeps
-exposure and destroys only the timing. If the null does as well, the return was
-payment for being in the market, not skill.
+exposure and destroys only timing. If the null does as well, the return was
+payment for being in the market.
 
-The null has two forms and picking the wrong one manufactures significance.
-A free **shuffle** scatters long holds into isolated bars, so with costs on the
-null pays an entry and an exit almost every bar — and any low-turnover strategy
-"beats random" for reasons that have nothing to do with timing. That mistake
-briefly produced p = 0.000 on nine out of nine tokens here, including the ones
-losing money. A circular **rotation** preserves every run and therefore the exact
-turnover, changing only *when* the series is applied. Rotation is the default
-whenever `--cost` is above zero.
+The null has two forms, and picking the wrong one manufactures significance. A
+free **shuffle** scatters long holds into isolated bars, so with costs on the
+null pays an entry and exit almost every bar — any low-turnover strategy then
+"beats random" for reasons unrelated to timing. That mistake briefly produced
+**p = 0.000 on nine of nine tokens, including every loser**. A circular
+**rotation** preserves every run and therefore exact turnover, changing only
+*when* the series applies. Rotation is the default whenever `--cost` > 0.
 
-**`ceiling`** — what perfect foresight earns on this series, at each cost. If an
-oracle that knows the future cannot clear your fee, no model can. It also tells
-you the opposite: on real `$WIF/SOL` 1h data an oracle committing for 20 bars at
-a time makes **+271% after 30bps**, so the money is unambiguously there.
+**`ceiling`** — what perfect foresight earns here, at each cost. If an oracle
+that knows the future cannot clear your fee, no model can and you should stop.
+It also says the opposite: on `$WIF/SOL` 1h an oracle committing 20 bars at a
+time makes **+271% after 30bps**, so the money is unambiguously there.
+
+## Account simulation
+
+`account` reports dollars for a real leveraged perp account, because three
+things only appear once you model the account rather than percentages:
+
+- **Fees land on notional.** At 2x, a 4.5bps taker costs 9bps of equity per side.
+- **Funding accrues hourly** on that same notional, and never stops while open.
+- **Liquidation is path-dependent** — the worst tick *inside* the trade decides
+  it, so bar lows are used for longs and highs for shorts. A close-only
+  simulation will happily trade through a wipeout.
 
 ## Results
 
-## Results
+### Synthetic data, where a signal is known to exist
 
-Synthetic data, generated from a known 3-regime process. The oracle that knows
-the true current regime makes +1185% at 30bps, with 6% time in market:
+Generated from a known 3-regime process. An oracle knowing the true current
+regime makes +1185% at 30bps with 6% time in market:
 
 | model | cost | ROI | trades | exposure | p-value |
 | --- | --- | --- | --- | --- | --- |
@@ -228,11 +235,10 @@ the true current regime makes +1185% at 30bps, with 6% time in market:
 | **HSMM** | 30bps | **+164%** | 60 | **6%** | **<0.001** |
 
 The HSMM reaches 6% exposure — the oracle's own figure — and clears realistic
-costs with real, significant timing skill. The HMM's apparently healthy +149% is
+costs with significant timing skill. The HMM's healthy-looking +149% is
 exposure, not skill.
 
-**On real meme coin data, none of this transfers.** Same configuration, same
-tests, live pools:
+### Real DEX data: none of it transfers
 
 | dataset | ceiling @30bps (hold 20) | HSMM @30bps | p-value |
 | --- | --- | --- | --- |
@@ -240,22 +246,27 @@ tests, live pools:
 | $WIF/SOL 1h | +271% | +0.2% | 0.018, 8 trades |
 | PEPE/WETH 1h | +93% | −2.5% | 0.14 |
 
+Across 9 live tokens at 30bps: confluence mean **+42.6%** against buy & hold
+**+73.0%**, beating hold on 2 of 9 — both in downtrends, where the gain came
+from being flat rather than from timing.
+
 ### The cost hypothesis, tested and rejected
 
-For a long stretch the working explanation was that fees were the barrier: a
-~60bps DEX round trip against a ~5bps per-bar signal. Hyperliquid perps test
-that directly — the same models, on data with **zero missing bars**, at **4.5bps
-a side** instead of 30, over 208 days of 1h history on the top 10 markets.
+The working explanation was long that fees were the barrier: a ~60bps DEX round
+trip against a ~5bps per-bar signal. Hyperliquid tests it directly — same
+models, **zero missing bars**, **4.5bps a side**, 208 days of 1h history on the
+top 10 perps.
 
 | | mean ROI | beat buy & hold |
 | --- | --- | --- |
-| single timeframe (duration-aware entry) | +23.9% | — |
+| single timeframe (duration-aware) | +23.9% | — |
 | 3TF confluence | +34.2% | 2 / 9 |
 | **buy & hold** | **+77.1%** | — |
 
 Cheaper fees and clean data did not rescue it. Three results crossed p < 0.05
-(SOL 0.005, ETH 0.014, XRP 0.035), but 18 tests were run, so ~1 false positive
-was expected — and splitting each in half settles it:
+(SOL 0.005, ETH 0.014, XRP 0.035), but 18 tests ran, so ~1 false positive was
+expected. Splitting each in half settles it — every edge lives in one half and
+vanishes in the other:
 
 ```
   coin   strategy    half 1 ROI    p1     half 2 ROI     p2
@@ -264,83 +275,130 @@ was expected — and splitting each in half settles it:
   XRP    conf             -2.6%  0.714        37.0%   0.041
 ```
 
-A third check settles it independently. Removing **the first 4 bars** of XRP's
-5004-bar series — same end date, same parameters — flips the result from 5
-trades and +33.4% to **0 trades and 0.0%**. Shifting the training window alone
-changes nothing, so this is not offset sensitivity: dropping 4 leading bars
-moves every walk-forward block boundary, and with only five trades in the whole
-period the outcome is one or two coin flips. Treat any result resting on fewer
-than a few dozen trades as unmeasured, whatever its p-value.
+All five coins examined also did better in half 2 — as did buy & hold, which
+rallied 20–51%. The "good" half is exposure to a rising market once again.
 
-Every apparent edge lives in exactly one half and vanishes in the other. All
-five coins examined also did better in half 2 — as did buy & hold, which rallied
-20–51% — so the "good" half is exposure to a rising market once again.
+A third check confirms it independently. Removing **the first 4 bars** of XRP's
+5004-bar series — same end date, same parameters — flips it from 5 trades and
++33.4% to **0 trades and 0.0%**. Shifting the training window alone changes
+nothing, so this is not offset sensitivity: dropping 4 leading bars moves every
+walk-forward boundary, and with five trades the outcome is one or two coin
+flips. Treat any result resting on fewer than a few dozen trades as unmeasured,
+whatever its p-value.
 
-Cost was never the binding constraint. Neither was data quality, nor the
-geometric-duration assumption, nor the timeframe. What has failed consistently,
-across two venues, two models, four timeframes and twenty tokens, is the premise
-that features derived from past price identify these regimes *before* they pay.
+### $50 account at 2x, top 10 Hyperliquid perps
+
+15m bars, real taker fees and hourly funding, liquidation checked intrabar.
+
+| | 1 week | 2 weeks |
+| --- | --- | --- |
+| 3TF confluence | **+5.3%** | +3.0% |
+| single timeframe | −3.1% | −2.7% |
+| 2x buy & hold | +3.3% | **+8.4%** |
+
+Beat hold over one week, lost to it over two — a sign flip between adjacent
+windows is what no edge looks like. Single-coin outcomes over 2 weeks ran from
+**$28.07 (PUMP, −44%) to $81.21 (ZEC, +62%)**, with 6 of 9 losing money. No
+liquidations: at 2x you need roughly a −49% move and the worst was −22%.
+
+Costs were *not* the problem here — fees $0.28–$0.73 and funding $0.08–$0.53 per
+coin over two weeks, under 2.5% of equity combined. The P&L came from direction,
+and direction was wrong more often than not.
+
+### What that leaves
+
+Four explanations have been eliminated with data: cost (4.5 vs 30bps), data
+quality (0% vs 26–88% gaps), the geometric-duration assumption (HSMM), and
+timeframe (1m through 4h). Across two venues, two models, four timeframes and
+twenty markets, what keeps failing is the premise — that features derived from
+past price identify these regimes *before* they pay.
+
+The ceilings confirm the money exists. Nothing in the price history finds it in
+advance. The next thing worth trying is data that is not a function of past
+price: order flow, holder concentration, LP changes, liquidations.
 
 ## Tests
 
-`bun test` validates both models against brute-force enumeration — all `K^T`
-state paths for the HMM, and every (state, duration) segmentation for the HSMM — forward log-likelihood, filtered marginals, smoothed
-marginals, and the Viterbi path all have to match exactly. Plus EM monotonicity,
-parameter recovery from data the model generated, causality of filtering and feature
-construction, and backtest accounting invariants.
+`bun test` — 96 tests. Both models are validated against brute-force
+enumeration: all `K^T` state paths for the HMM, and every (state, duration)
+segmentation for the HSMM. Forward log-likelihood, filtered marginals, smoothed
+marginals and the Viterbi path must match exactly. Plus EM monotonicity,
+parameter recovery from generated data, causality of filtering and of feature
+construction, multi-timeframe lookahead guards, trade-ledger accounting against
+hand-computed values, and leveraged account accounting including liquidation
+paths.
 
 ## Layout
 
 ```
 src/hmm.ts          forward-backward, Baum-Welch, Viterbi, filtering (no deps)
 src/hsmm.ts         explicit-duration HSMM: segmental EM, run-length filtering
-src/hyperliquid.ts  perp market list and candles, no gaps, 4.5bps fees
-src/confluence.ts   multi-timeframe stack, completed-bar alignment
-src/diagnostics.ts  permutation test (shuffle/rotate nulls), ceiling analysis
 src/features.ts     candles -> features, train-only standardization
-src/sources.ts      GeckoTerminal + DexScreener clients, paging, gaps, cache
+src/confluence.ts   multi-timeframe stack, completed-bar alignment
+src/backtest.ts     walk-forward harness, signal, trade ledger, metrics
+src/perp.ts         leveraged account: notional fees, funding, liquidation
+src/diagnostics.ts  permutation test (shuffle/rotate nulls), ceiling analysis
+src/hyperliquid.ts  perp candles, funding, market list
+src/sources.ts      GeckoTerminal + DexScreener, paging, gaps, cache
 src/data.ts         CSV parsing, synthetic regime-switching generator
-src/backtest.ts     walk-forward harness, signal, cost accounting, metrics
-src/cli.ts          trending / search / fetch / train / backtest / predict / demo
-src/hmm.test.ts     brute-force validation and model invariants
-src/hsmm.test.ts    brute-force over all segmentations, duration recovery
-src/diagnostics.test.ts  permutation and ceiling invariants
-src/confluence.test.ts   aggregation, alignment, lookahead guards
-src/trades.test.ts       ledger accounting vs hand-computed values
-src/sources.test.ts timeframes, network aliases, gap filling
+src/cli.ts          all commands
+```
+
+Tests sit beside each module as `*.test.ts`.
+
+## Commands
+
+```
+top         top markets, screened for modelability (--source hyperliquid for perps)
+trending    what is moving right now (GeckoTerminal)
+search      find the deepest real pool for a ticker
+fetch       pull candles to CSV
+train       fit and inspect the regimes, optionally save the model
+predict     current state + next-bar forecast + signal
+backtest    walk-forward out-of-sample, with a cost-sensitivity sweep
+confluence  3-timeframe scalping stack
+trades      trade ledger + ROI by 24h / 5d / 1w / 2w window
+account     dollar P&L for a leveraged perp account
+validate    is the return skill, or exposure?
+ceiling     what would perfect foresight earn here?
+demo        synthetic end-to-end walkthrough
 ```
 
 ## Flags
 
 ```
-Live     --token <sym>  --pool <addr>  --network solana  --timeframe 5m
-         --bars 3000  --fill  --max-fill 12  --min-liquidity  --min-volume
-         --no-cache
-Data     --csv <path>  --window 20  --no-vol  --no-volume
-Model    --model-type hmm|hsmm  --hsmm  --max-duration 30
-         --states 3  --restarts 8  --seed 42  --out model.json
-Conflu   confluence --factors 12,3,1  --gate 0  --trigger 0  --short
-Diag     validate --trials 1000  |  ceiling --holds 1,5,20  --costs 0,10,30
-         trades --show 15  (ledger + ROI by 24h/5d/1w/2w window)
-Strategy --entry <bps, default 2x cost>  --exit 0  --short  --cost 30
-         --vol-target 0  --max-pos 1
-Walkfwd  --train 1500  --test 500  --bars-per-year 105120  --verbose
+Hyperliquid --coin BTC  --timeframe 5m|15m|1h|4h|1d  --bars 5000
+DEX         --token <sym>  --pool <addr>  --network solana  --fill  --max-fill 12
+            --min-liquidity  --min-volume  --no-cache
+Data        --csv <path>  --window 5  --no-vol  --no-volume
+Model       --model-type hmm|hsmm  --hsmm  --max-duration 30
+            --states 3  --restarts 8  --seed 42  --out model.json
+Strategy    --cost 4.5  --entry <bps>  --duration-aware  --confidence 0
+            --exit 0  --short  --vol-target 0  --max-pos 1
+Confluence  --factors 12,3,1  --gate 0  --trigger 0  --bias-confidence 0
+            --no-flip-exit
+Account     --equity 50  --leverage 2  --days 14  --single  --min-order 10
+Diagnostics --trials 1000  --costs 0,10,30  --holds 1,5,20  --show 15
+Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
 ```
 
 ## Limits worth knowing
 
-- Gaussian emissions understate meme coin tails. The features are chosen to be as
-  close to Gaussian as they can be (log vol rather than vol), but a genuine 40%
-  candle is still far outside what the model thinks is possible.
-- `K` is fixed, not selected. Compare log-likelihood per bar across `--states` values
+- Gaussian emissions understate crypto tails. The features are chosen to be as
+  close to Gaussian as possible (log vol rather than vol), but a genuine 40%
+  candle is far outside what the model thinks can happen.
+- `K` is fixed, not selected. Compare log-likelihood per bar across `--states`
   with a BIC-style penalty if you want to choose it properly.
 - The HSMM costs roughly 15x the HMM to fit (O(T·K·maxDuration) per EM sweep).
   Lower `--max-duration` if that bites; 30 was as good as 60 in testing.
-- Nothing here models MEV, honeypots, or the possibility that the chart ends at
-  zero — the risks that actually dominate this asset class. Pool liquidity is used
-  to pick which pool to read, not to model the price impact of your own order.
-- The newest coins, where the pump regime is most dramatic, have the least
-  history. A pool minutes old has nothing to fit. `trending` shows what is moving;
-  it is not a list of things you can model.
-- Backtest results on your own data are not a forecast. Slippage on a thin book is
-  worse than any fixed bps assumption, and worst exactly when the model wants to trade.
+- Hyperliquid retains ~5000 candles per interval, so 5m gives ~17 days and 1h
+  gives ~208. Pick the interval for the history you need.
+- Past backtest ROI does not predict future ROI. Measured across 9 tokens split
+  into halves, rank correlation was **0.033**, while correlation between
+  strategy ROI and buy & hold was **0.950** — the "high ROI" names are simply
+  the ones that went up. Do not select tokens this way.
+- Nothing here models MEV, honeypots, or the chart ending at zero. Pool
+  liquidity picks which pool to read; it does not model your own price impact.
+- Backtest results are not a forecast, and none of this is financial advice.
+  Slippage on a thin book is worse than any fixed bps assumption, and worst
+  exactly when the model wants to trade.
