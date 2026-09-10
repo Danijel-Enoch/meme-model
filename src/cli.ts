@@ -17,6 +17,7 @@ import { walkForwardConfluence, DEFAULT_STACK, type TimeframeSpec } from "./conf
 import * as hl from "./hyperliquid";
 import { simulatePerp } from "./perp";
 import { shuffledSeries, blockShuffledSeries, falsePositiveRate, bootstrapTrades } from "./montecarlo";
+import { runMcmc, posteriorStateMeans, posteriorDurations, posteriorSignal, DEFAULT_PRIORS } from "./mcmc";
 
 type Flags = Record<string, string | boolean>;
 
@@ -927,6 +928,86 @@ async function cmdMonteCarlo(f: Flags) {
   }
 }
 
+/**
+ * Bayesian posterior over the model, by Gibbs sampling.
+ *
+ * Every other command plugs EM's point estimates into the signal as if they
+ * were known. This puts credible intervals on them and, more usefully, on the
+ * signal itself — so the question becomes "what is the probability the expected
+ * move clears the round trip", which is the one a trader actually has.
+ */
+async function cmdPosterior(f: Flags) {
+  const ds = await getDataSet(f);
+  const featureCfg = {
+    window: num(f, "window", DEFAULT_WINDOW),
+    useVolatility: !bool(f, "no-vol"),
+    useVolume: !bool(f, "no-volume"),
+  };
+  const states = num(f, "states", 3);
+  const costBps = num(f, "cost", hl.HL_TAKER_BPS);
+  const roundTrip = (2 * costBps) / 10_000;
+
+  const fs = buildFeatures(ds.candles, featureCfg);
+  const scaler = fitScaler(fs.X, fs.T, fs.D);
+  const Z = applyScaler(fs.X, fs.T, fs.D, scaler);
+
+  // Warm-start from EM: the chain mixes far better from a sensible segmentation.
+  const em = fit(Z, fs.T, fs.D, { states, restarts: num(f, "restarts", 4), seed: num(f, "seed", 42) });
+  const iterations = num(f, "iterations", 1200);
+  console.log(`\nPosterior for ${ds.label} — ${states} states, ${fs.T} bars`);
+  console.log(`  Gibbs: ${iterations} sweeps, ${num(f, "burn-in", Math.floor(iterations / 2))} burn-in, thin ${num(f, "thin", 3)}`);
+  console.log(`  prior kappa0 = ${num(f, "kappa0", DEFAULT_PRIORS.kappa0)} (shrinkage toward zero drift)\n`);
+
+  const res = runMcmc(Z, fs.T, fs.D, {
+    states, iterations,
+    burnIn: num(f, "burn-in", Math.floor(iterations / 2)),
+    thin: num(f, "thin", 3),
+    seed: num(f, "seed", 11),
+    init: em.params,
+    priors: { kappa0: num(f, "kappa0", DEFAULT_PRIORS.kappa0) },
+  });
+
+  const un = (v: number) => unscale(v, 0, scaler);
+  const ints = posteriorStateMeans(res, 0, un, 0.9);
+  const durs = posteriorDurations(res, 0.9);
+  const b = (x: number) => (x * 10_000).toFixed(1);
+
+  console.log("  state   EM point   posterior mean     90% credible interval    P(mu>0)   dwell");
+  for (let k = 0; k < states; k++) {
+    console.log(
+      `    ${k}    ${b(un(em.params.mu[k * fs.D])).padStart(8)}bps ${b(ints[k].mean).padStart(12)}bps  ` +
+      `[${b(ints[k].lower).padStart(8)}, ${b(ints[k].upper).padStart(7)}]bps  ` +
+      `${(ints[k].pPositive * 100).toFixed(0).padStart(5)}%  ${durs[k].median.toFixed(0).padStart(5)}b`);
+  }
+
+  const top = states - 1;
+  const width = ints[top].upper - ints[top].lower;
+  console.log(`\n  bullish-state interval is ${b(width)}bps wide, against a ${(roundTrip * 10_000).toFixed(1)}bps round trip` +
+    `  (${(width / roundTrip).toFixed(1)}x)`);
+  if (ints[top].upper < roundTrip) {
+    console.log("  even the optimistic end of that interval does not clear the round trip.");
+  }
+
+  // What the model would actually trade right now.
+  const { alpha } = filter(Z, fs.T, em.params);
+  const nx = predictNext(alpha, (fs.T - 1) * states, em.params);
+  const sig = posteriorSignal(res, Array.from(nx), un, roundTrip, 0.9);
+  console.log(`\n  Signal at the last bar (blended over the state belief)`);
+  console.log(`    median ${b(sig.median)}bps   90% CI [${b(sig.lower)}, ${b(sig.upper)}]bps`);
+  console.log(`    P(edge > 0)          ${(sig.pPositive * 100).toFixed(1)}%`);
+  console.log(`    P(edge > round trip) ${(sig.pAboveCost * 100).toFixed(1)}%`);
+  console.log(sig.pAboveCost < 0.5
+    ? "    => not worth taking: the posterior does not favour clearing costs."
+    : "    => the posterior favours clearing costs.");
+
+  // Where the uncertainty lives: knowing the state would be worth a lot more.
+  const dwell = durs[top].median;
+  console.log(`\n  If the state were known with certainty, holding the bullish state for its`);
+  console.log(`  median ${dwell.toFixed(0)} bars would be worth ~${b(ints[top].mean * dwell)}bps against ${(roundTrip * 10_000).toFixed(1)}bps of cost.`);
+  console.log(`  The gap between that and the blended signal above is state uncertainty,`);
+  console.log(`  not parameter uncertainty.`);
+}
+
 const WINDOWS: [string, number][] = [
   ["24h", 1], ["5d", 5], ["1w", 7], ["2w", 14],
 ];
@@ -1208,6 +1289,7 @@ meme-hmm — a hidden Markov model for meme coin regimes
   bun run src/cli.ts confluence --token WIF            3-timeframe scalping stack
   bun run src/cli.ts account --coin SOL --equity 50 --leverage 2   dollar P&L
   bun run src/cli.ts trades   --token WIF              trade ledger + ROI by window
+  bun run src/cli.ts posterior  --coin SOL             credible intervals on the edge
   bun run src/cli.ts montecarlo --coin SOL             how often does this cry wolf?
   bun run src/cli.ts validate --token WIF              is it skill or exposure?
   bun run src/cli.ts ceiling  --token WIF              is there money to find?
@@ -1235,6 +1317,12 @@ Diagnostics
   --costs 0,10,30     cost levels to report
   --holds 1,5,20      ceiling: bars an oracle commits for
   --trials 1000       validate: number of shuffles
+
+Posterior (Bayesian HMM by Gibbs sampling)
+  --iterations 1200   sweeps; half are burn-in by default
+  --burn-in <n>       override the burn-in
+  --thin 3            keep every nth post-burn-in draw
+  --kappa0 0.5        prior strength pulling state means toward zero drift
 
 Monte Carlo
   --nulls 100         null series to run the whole pipeline against
@@ -1323,6 +1411,7 @@ try {
   else if (cmd === "confluence") await cmdConfluence(flags);
   else if (cmd === "account") await cmdAccount(flags);
   else if (cmd === "montecarlo") await cmdMonteCarlo(flags);
+  else if (cmd === "posterior") await cmdPosterior(flags);
   else usage();
 } catch (e) {
   console.error(`\nerror: ${e instanceof Error ? e.message : String(e)}`);

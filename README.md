@@ -19,7 +19,7 @@ machinery that establishes that rather than hiding it. See [Results](#results).
 ```bash
 bun install
 bun run demo      # synthetic end-to-end walkthrough
-bun test          # 112 tests, incl. brute-force validation of both models
+bun test          # 127 tests, incl. brute-force validation of both models
 ```
 
 Hyperliquid perps — clean data, 4.5bps taker, no API key:
@@ -243,6 +243,57 @@ none of them survived a split-half test.
 The best null run returned **+74.5%**. Any single impressive backtest in this
 domain is consistent with nothing at all.
 
+## Posterior (`posterior`)
+
+Every other command plugs EM's point estimates for `mu_k` into the signal as
+though they were known. They are not: a rare pump state might own 200 of 3000
+bars, and its mean return has a standard error. A Gibbs sampler — forward-filter
+backward-sample for the state path, conjugate Dirichlet and Normal-Inverse-Gamma
+draws for the parameters — puts credible intervals on both the parameters and on
+the signal itself.
+
+Correctness rests on a check worth stating: averaging many FFBS draws converges
+to the smoothed posterior from `posteriors()`, which is itself validated against
+brute-force enumeration. Labels are re-sorted by mean return every sweep, because
+otherwise label switching turns the averaged posterior into mush.
+
+### What the posterior found
+
+| dataset | bullish state, 90% CI | round trip | CI width vs cost | P(edge > round trip) |
+| --- | --- | --- | --- | --- |
+| synthetic 5m | [11.1, 76.7] bps | 60bps | 1.1x | **0.0%** |
+| SOL-PERP 1h | [0.6, 10.0] bps | 9bps | 1.0x | **0.0%** |
+| BTC-PERP 1h | [0.5, 6.3] bps | 9bps | 0.6x | **0.0%** |
+| USELESS/SOL 5m | [2.3, 12.0] bps | 60bps | 0.2x | **0.0%** |
+
+On BTC the *entire* 90% interval sits below the round trip: even the optimistic
+end of the bullish state does not pay for the trade.
+
+The posterior barely moved EM's estimates (−14.2 → −14.7, +44.6 → +43.4 on
+synthetic), so with thousands of bars EM was not wrong. The uncertainty was
+simply never propagated into the signal.
+
+### Where the uncertainty actually lives
+
+It is not the parameters. Knowing the state would be worth plenty:
+
+```
+  dataset          mu_bull  dwell   edge if certain   mean blended   round trip
+  synthetic 5m     44.6bps     7b           300bps        5.97bps         60bps
+  SOL-PERP 1h       4.9bps     8b            37bps        0.95bps          9bps
+  BTC-PERP 1h       2.8bps     8b            22bps        0.63bps          9bps
+  USELESS 5m        4.2bps     6b            27bps        2.67bps         60bps
+```
+
+"Edge if certain" clears the round trip almost everywhere. What the model
+actually trades is `sum_k P(k) * mu_k`, and diffuse state beliefs dilute that to
+under 6bps. Peak confidence reaches only 85–88%, and rarely.
+
+So the binding constraint is **state identification**, not parameter estimation
+and not cost. That is the sharpest statement of the problem this repo has
+produced, and it points at the same place everything else did: you need
+information beyond past price to know which regime you are in.
+
 ## Account simulation
 
 `account` reports dollars for a real leveraged perp account, because three
@@ -372,6 +423,8 @@ src/confluence.ts   multi-timeframe stack, completed-bar alignment
 src/backtest.ts     walk-forward harness, signal, trade ledger, metrics
 src/perp.ts         leveraged account: notional fees, funding, liquidation
 src/diagnostics.ts  permutation test (shuffle/rotate nulls), ceiling analysis
+src/mcmc.ts         Bayesian HMM by Gibbs sampling: FFBS, conjugate draws,
+                    credible intervals on parameters and on the signal
 src/montecarlo.ts   null-series generation, pipeline false-positive rate,
                     trade bootstrap for outcome distributions
 src/hyperliquid.ts  perp candles, funding, market list
@@ -397,6 +450,7 @@ trades      trade ledger + ROI by 24h / 5d / 1w / 2w window
 account     dollar P&L for a leveraged perp account
 validate    is the return skill, or exposure?
 montecarlo  how often does this pipeline cry wolf? plus outcome bootstrap
+posterior   credible intervals on the state means and on the edge
 ceiling     what would perfect foresight earn here?
 demo        synthetic end-to-end walkthrough
 ```
@@ -417,6 +471,7 @@ Confluence  --factors 12,3,1  --gate 0  --trigger 0  --bias-confidence 0
 Account     --equity 50  --leverage 2  --days 14  --single  --min-order 10
 Diagnostics --trials 1000  --costs 0,10,30  --holds 1,5,20  --show 15
 MonteCarlo  --nulls 100  --block 50  --no-bootstrap
+Posterior   --iterations 1200  --burn-in <n>  --thin 3  --kappa0 0.5
 Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
 ```
 
@@ -425,6 +480,8 @@ Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
 - Gaussian emissions understate crypto tails. The features are chosen to be as
   close to Gaussian as possible (log vol rather than vol), but a genuine 40%
   candle is far outside what the model thinks can happen.
+- The signal is a point estimate everywhere except `posterior`. If you build on
+  this, gate on `P(edge > round trip)` rather than on the plugged-in mean.
 - `K` is fixed, not selected. Compare log-likelihood per bar across `--states`
   with a BIC-style penalty if you want to choose it properly.
 - The HSMM costs roughly 15x the HMM to fit (O(T·K·maxDuration) per EM sweep).
