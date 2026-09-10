@@ -19,7 +19,7 @@ machinery that establishes that rather than hiding it. See [Results](#results).
 ```bash
 bun install
 bun run demo      # synthetic end-to-end walkthrough
-bun test          # 96 tests, incl. brute-force validation of both models
+bun test          # 112 tests, incl. brute-force validation of both models
 ```
 
 Hyperliquid perps — clean data, 4.5bps taker, no API key:
@@ -204,10 +204,44 @@ null pays an entry and exit almost every bar — any low-turnover strategy then
 **rotation** preserves every run and therefore exact turnover, changing only
 *when* the series applies. Rotation is the default whenever `--cost` > 0.
 
+**`montecarlo`** — runs the *entire* pipeline against series that provably
+contain no timing signal, and counts how often it declares victory. This
+calibrates every other number in the repo. See the results below.
+
 **`ceiling`** — what perfect foresight earns here, at each cost. If an oracle
 that knows the future cannot clear your fee, no model can and you should stop.
 It also says the opposite: on `$WIF/SOL` 1h an oracle committing 20 bars at a
 time makes **+271% after 30bps**, so the money is unambiguously there.
+
+### What the Monte Carlo found
+
+Null series keep the marginal return distribution, the fat tails and the
+return/volume relationship, and destroy only the temporal order. Running the
+full confluence pipeline plus permutation test over 100 of them:
+
+| | iid shuffle | block shuffle (keeps vol clustering) |
+| --- | --- | --- |
+| single-series false-positive rate | **4.1%** | **3.4%** |
+| nominal | 5% | 5% |
+
+**The permutation test is honestly calibrated on one series.** A p-value of
+0.04 on a single market means what it says.
+
+Scanning is what destroys it:
+
+```
+  scan  5 markets, report the best:   4/19 batches "significant" on pure noise
+  scan 10 markets, report the best:   3/9  batches "significant"  (33%)
+  scan 20 markets, report the best:   3/4  batches "significant"  (75%)
+```
+
+This repo scanned 9–10 markets repeatedly. At that width, a third of scans
+produce a p < 0.05 result from noise alone — which is precisely the rate at
+which the three "significant" hits (SOL, ETH, XRP) appeared, and exactly why
+none of them survived a split-half test.
+
+The best null run returned **+74.5%**. Any single impressive backtest in this
+domain is consistent with nothing at all.
 
 ## Account simulation
 
@@ -338,6 +372,8 @@ src/confluence.ts   multi-timeframe stack, completed-bar alignment
 src/backtest.ts     walk-forward harness, signal, trade ledger, metrics
 src/perp.ts         leveraged account: notional fees, funding, liquidation
 src/diagnostics.ts  permutation test (shuffle/rotate nulls), ceiling analysis
+src/montecarlo.ts   null-series generation, pipeline false-positive rate,
+                    trade bootstrap for outcome distributions
 src/hyperliquid.ts  perp candles, funding, market list
 src/sources.ts      GeckoTerminal + DexScreener, paging, gaps, cache
 src/data.ts         CSV parsing, synthetic regime-switching generator
@@ -360,6 +396,7 @@ confluence  3-timeframe scalping stack
 trades      trade ledger + ROI by 24h / 5d / 1w / 2w window
 account     dollar P&L for a leveraged perp account
 validate    is the return skill, or exposure?
+montecarlo  how often does this pipeline cry wolf? plus outcome bootstrap
 ceiling     what would perfect foresight earn here?
 demo        synthetic end-to-end walkthrough
 ```
@@ -379,6 +416,7 @@ Confluence  --factors 12,3,1  --gate 0  --trigger 0  --bias-confidence 0
             --no-flip-exit
 Account     --equity 50  --leverage 2  --days 14  --single  --min-order 10
 Diagnostics --trials 1000  --costs 0,10,30  --holds 1,5,20  --show 15
+MonteCarlo  --nulls 100  --block 50  --no-bootstrap
 Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
 ```
 
@@ -393,6 +431,9 @@ Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
   Lower `--max-duration` if that bites; 30 was as good as 60 in testing.
 - Hyperliquid retains ~5000 candles per interval, so 5m gives ~17 days and 1h
   gives ~208. Pick the interval for the history you need.
+- One backtest is one draw. Bootstrapping the $50 @ 2x ledgers, a run that
+  reported $81.21 sat in a 5th-95th range of **$38.86 to $241.79**. With fewer
+  than a few dozen trades the headline number carries almost no information.
 - Past backtest ROI does not predict future ROI. Measured across 9 tokens split
   into halves, rank correlation was **0.033**, while correlation between
   strategy ROI and buy & hold was **0.950** — the "high ROI" names are simply

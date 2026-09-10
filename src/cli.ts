@@ -12,10 +12,11 @@ import {
 } from "./sources";
 import { walkForward, stateMeanReturns, extractTrades, summarizeTrades, type StrategyConfig, type WalkForwardConfig, type ModelType, type Trade } from "./backtest";
 import { fitHsmm, filterHsmm, viterbiHsmm, expectedDurations, serializeHsmm, deserializeHsmm, type HsmmParams } from "./hsmm";
-import { permutationTest, ceilingAnalysis, tradedSeries } from "./diagnostics";
+import { permutationTest, ceilingAnalysis, tradedSeries, compound } from "./diagnostics";
 import { walkForwardConfluence, DEFAULT_STACK, type TimeframeSpec } from "./confluence";
 import * as hl from "./hyperliquid";
 import { simulatePerp } from "./perp";
+import { shuffledSeries, blockShuffledSeries, falsePositiveRate, bootstrapTrades } from "./montecarlo";
 
 type Flags = Record<string, string | boolean>;
 
@@ -820,6 +821,112 @@ async function cmdAccount(f: Flags) {
   }
 }
 
+/**
+ * Monte Carlo: how often does this pipeline cry wolf, and what was the spread
+ * behind the single number the backtest reported?
+ */
+async function cmdMonteCarlo(f: Flags) {
+  const ds = await getDataSet(f);
+  const featureCfg = {
+    window: num(f, "window", DEFAULT_WINDOW),
+    useVolatility: !bool(f, "no-vol"),
+    useVolume: !bool(f, "no-volume"),
+  };
+  const cost = num(f, "cost", hl.HL_TAKER_BPS);
+  const trainSize = num(f, "train", 3000);
+  const testSize = num(f, "test", 700);
+  const trials = num(f, "nulls", 100);
+  const block = num(f, "block", 0);
+
+  const runStrategy = (candles: Candle[]) =>
+    walkForwardConfluence(candles, DEFAULT_STACK,
+      { featureConfig: featureCfg, states: num(f, "states", 3), modelType: modelType(f),
+        seed: num(f, "seed", 42), restarts: num(f, "restarts", 2), trainSize, testSize },
+      { gateBps: 0, triggerBps: 0, exitOnBiasFlip: true }).positions;
+
+  console.log(`\nMonte Carlo on ${ds.label} — ${trials} null series, ${block ? `block shuffle (${block})` : "iid shuffle"}`);
+  console.log("Nulls keep the marginal return distribution and the fat tails, and destroy");
+  console.log("all temporal structure. Anything found in them is by construction an artefact.\n");
+
+  const res = falsePositiveRate(ds.candles, (nullCandles) => {
+    const positions = runStrategy(nullCandles);
+    const ts = tradedSeries(nullCandles, featureCfg, positions, trainSize);
+    let n = 0, prev = 0;
+    for (const p of ts.positions) { if (Math.abs(p - prev) > 1e-9) n++; prev = p; }
+    if (n === 0) return null;
+    const perm = permutationTest(ts.positions, ts.returns,
+      { trials: num(f, "trials", 400), seed: 7, costBps: cost });
+    return { pValue: perm.pValue, roi: compound(ts.positions, ts.returns, cost), trades: n };
+  }, { trials, alpha: 0.05, seed: num(f, "seed", 2024), blockSize: block });
+
+  console.log(`  trials            ${res.trials}  (${res.noTrades} took no trades, excluded)`);
+  console.log(`  reported p < 0.05 ${res.significant} / ${res.pValues.length}  =  ${pct(res.rate)}   (nominal ${pct(res.expected)})`);
+  console.log(res.rate <= 0.08
+    ? "  => calibrated on a SINGLE series: one p-value means what it says"
+    : "  => OPTIMISTIC: the test over-reports significance even on one series");
+
+  const sorted = [...res.rois].sort((a, b) => a - b);
+  const q = (x: number) => sorted[Math.floor(x * (sorted.length - 1))];
+  if (sorted.length > 0) {
+    console.log(`\n  ROI on data containing no TIMING signal:`);
+    console.log(`    5th ${pct(q(0.05))}   median ${pct(q(0.5))}   95th ${pct(q(0.95))}   best ${pct(sorted[sorted.length - 1])}`);
+    console.log(`    ${res.rois.filter((r) => r > 0).length}/${res.rois.length} null runs were profitable`);
+    // Shuffling preserves the sum of the returns, so a null series has the same
+    // total drift as the original. A long-biased strategy on a series that
+    // drifted up will profit on the nulls too, and that is correct: the drift
+    // is real, only the ORDER was destroyed. Read the p-value, not the ROI.
+    console.log(`    (shuffling preserves total drift, so profit here is expected on a`);
+    console.log(`     series that trended — the p-value is what tests timing)`);
+  }
+
+  // The realistic research scenario is not one test, it is a scan.
+  console.log(`\n  If you scan N markets and report the best one:`);
+  for (const batch of [5, 10, 20]) {
+    if (res.pValues.length < batch) continue;
+    let hits = 0, groups = 0;
+    for (let i = 0; i + batch <= res.pValues.length; i += batch) {
+      if (Math.min(...res.pValues.slice(i, i + batch)) < 0.05) hits++;
+      groups++;
+    }
+    console.log(`    N=${String(batch).padStart(2)}: ${hits}/${groups} batches produced a "significant" result on pure noise`);
+  }
+  console.log("\n  Divide your alpha by the number of markets you looked at, or you are");
+  console.log("  simply reporting the luckiest one.");
+
+  // Second half: the spread behind the reported number, on the real series.
+  if (str(f, "coin") && !bool(f, "no-bootstrap")) {
+    const equity = num(f, "equity", 50);
+    const leverage = num(f, "leverage", 2);
+    const days = num(f, "days", 14);
+    const markets = await hl.topMarkets(200);
+    const market = markets.find((m) => m.coin === str(f, "coin")!.toUpperCase());
+    const lastTime = ds.candles[ds.candles.length - 1].time;
+    const funding = await hl.fetchFunding(str(f, "coin")!.toUpperCase(), (lastTime - (days + 7) * 86_400) * 1000);
+
+    const fs = buildFeatures(ds.candles, featureCfg);
+    const cutoff = lastTime - days * 86_400;
+    let from = trainSize;
+    for (let i = 0; i < fs.T; i++) {
+      if (ds.candles[fs.index[i]].time >= cutoff) { from = Math.max(i, trainSize); break; }
+    }
+    const sim = simulatePerp(ds.candles, featureCfg, runStrategy(ds.candles), funding,
+      { startingEquity: equity, leverage, takerBps: cost,
+        maintenanceMarginFraction: hl.maintenanceMarginFraction(market?.maxLeverage ?? 10),
+        minOrderUsd: 10 }, from);
+
+    if (sim.trades.length > 0) {
+      const b = bootstrapTrades(sim.trades, equity, { trials: 5000, seed: 99 });
+      const m$ = (x: number) => `$${x.toFixed(2)}`;
+      console.log(`\n  Bootstrap of the actual ${days}-day run ($${equity} @ ${leverage}x, ${sim.trades.length} trades)`);
+      console.log(`    the backtest reported  ${m$(sim.finalEquity)}`);
+      console.log(`    5th   ${m$(b.p05)}      25th  ${m$(b.p25)}      median ${m$(b.median)}`);
+      console.log(`    75th  ${m$(b.p75)}      95th  ${m$(b.p95)}`);
+      console.log(`    P(ending down) ${pct(b.probLoss)}   P(losing half) ${pct(b.probHalved)}   P(ruin) ${pct(b.probRuin)}`);
+      console.log(`\n    With ${sim.trades.length} trades the reported figure is one draw from that range.`);
+    }
+  }
+}
+
 const WINDOWS: [string, number][] = [
   ["24h", 1], ["5d", 5], ["1w", 7], ["2w", 14],
 ];
@@ -1101,6 +1208,7 @@ meme-hmm — a hidden Markov model for meme coin regimes
   bun run src/cli.ts confluence --token WIF            3-timeframe scalping stack
   bun run src/cli.ts account --coin SOL --equity 50 --leverage 2   dollar P&L
   bun run src/cli.ts trades   --token WIF              trade ledger + ROI by window
+  bun run src/cli.ts montecarlo --coin SOL             how often does this cry wolf?
   bun run src/cli.ts validate --token WIF              is it skill or exposure?
   bun run src/cli.ts ceiling  --token WIF              is there money to find?
   bun run src/cli.ts demo                             synthetic walkthrough
@@ -1127,6 +1235,12 @@ Diagnostics
   --costs 0,10,30     cost levels to report
   --holds 1,5,20      ceiling: bars an oracle commits for
   --trials 1000       validate: number of shuffles
+
+Monte Carlo
+  --nulls 100         null series to run the whole pipeline against
+  --block 0           >0 resamples in blocks, preserving volatility clustering
+  --trials 400        permutation trials inside each null run
+  --no-bootstrap      skip the account-outcome bootstrap
 
 Account simulation (perps only)
   --equity 50         starting margin in USD
@@ -1208,6 +1322,7 @@ try {
   else if (cmd === "trades") await cmdTrades(flags);
   else if (cmd === "confluence") await cmdConfluence(flags);
   else if (cmd === "account") await cmdAccount(flags);
+  else if (cmd === "montecarlo") await cmdMonteCarlo(flags);
   else usage();
 } catch (e) {
   console.error(`\nerror: ${e instanceof Error ? e.message : String(e)}`);
