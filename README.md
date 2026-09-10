@@ -259,19 +259,31 @@ otherwise label switching turns the averaged posterior into mush.
 
 ### What the posterior found
 
-| dataset | bullish state, 90% CI | round trip | CI width vs cost | P(edge > round trip) |
-| --- | --- | --- | --- | --- |
-| synthetic 5m | [11.1, 76.7] bps | 60bps | 1.1x | **0.0%** |
-| SOL-PERP 1h | [0.6, 10.0] bps | 9bps | 1.0x | **0.0%** |
-| BTC-PERP 1h | [0.5, 6.3] bps | 9bps | 0.6x | **0.0%** |
-| USELESS/SOL 5m | [2.3, 12.0] bps | 60bps | 0.2x | **0.0%** |
+The hurdle a signal must clear is the round trip, paid once. The edge is
+per-bar and accumulates over the hold, so the comparison is
+`edge x holdBars > roundTrip` — testing one bar's edge against the whole round
+trip is the same category error that `--duration-aware` exists to avoid. Both
+the edge and the dwell are drawn from the posterior.
 
-On BTC the *entire* 90% interval sits below the round trip: even the optimistic
-end of the bullish state does not pay for the trade.
+Evaluated at the last bar of each series:
 
-The posterior barely moved EM's estimates (−14.2 → −14.7, +44.6 → +43.4 on
-synthetic), so with thousands of bars EM was not wrong. The uncertainty was
-simply never propagated into the signal.
+| dataset | per-bar edge | hold | edge x hold, 90% CI | round trip | P(clears) |
+| --- | --- | --- | --- | --- | --- |
+| synthetic 5m | −1.5bps | 6.8b | [−39.3, 13.5] bps | 60bps | 0.0% |
+| SOL-PERP 1h | +0.3bps | 7.5b | [−14.5, 19.9] bps | 9bps | 24.5% |
+| BTC-PERP 1h | −0.5bps | 8.2b | [−13.8, 3.2] bps | 9bps | 0.5% |
+| USELESS/SOL 5m | +3.2bps | 7.6b | [−7.5, 61.0] bps | 60bps | 5.5% |
+
+The intervals straddle zero everywhere. Even where the point estimate looks
+healthy — USELESS at +26bps a trade — the 90% interval runs from −7.5 to +61,
+so the model does not know whether the trade has an edge at all.
+
+**A high P(clears) is not a green light.** On the meme coins, JUGGERNAUT scored
+89.7% at a 60bps round trip and its realised confluence ROI was **−49.8%**
+against +1.8% for buy and hold. The posterior is a statement about the
+*expected* return conditional on the state belief being right; realised returns
+are dominated by per-bar volatility of 60–360bps, and the state belief is the
+part that has consistently failed.
 
 ### Where the uncertainty actually lives
 
@@ -481,7 +493,9 @@ Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
   close to Gaussian as possible (log vol rather than vol), but a genuine 40%
   candle is far outside what the model thinks can happen.
 - The signal is a point estimate everywhere except `posterior`. If you build on
-  this, gate on `P(edge > round trip)` rather than on the plugged-in mean.
+  this, gate on `P(edge x hold > round trip)` rather than on the plugged-in
+  mean — and remember that clearing the hurdle in expectation says nothing about
+  the variance of any individual trade.
 - `K` is fixed, not selected. Compare log-likelihood per bar across `--states`
   with a BIC-style penalty if you want to choose it properly.
 - The HSMM costs roughly 15x the HMM to fit (O(T·K·maxDuration) per EM sweep).

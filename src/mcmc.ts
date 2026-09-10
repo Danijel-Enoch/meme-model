@@ -338,9 +338,19 @@ export function posteriorDurations(res: McmcResult, credible = 0.9): Interval[] 
  * Posterior of the trading signal itself.
  *
  * Rather than plugging point estimates into sum_k P(k) * mu_k, this evaluates
- * that sum under every retained draw. The spread is the honest uncertainty on
- * the edge, and `pAboveCost` is the question a trader actually has: what is the
- * probability the expected move clears the round trip?
+ * that sum under every retained draw, so the spread is honest uncertainty on
+ * the edge rather than a single number pretending to be known.
+ *
+ * THE COMPARISON THAT MATTERS. `edge` is a PER-BAR quantity; the round trip is
+ * paid ONCE. Testing one bar's expected return against the whole round trip is
+ * a category error — the same one that silently produced zero trades before
+ * `--duration-aware` existed. A position held for its regime's dwell time
+ * accumulates `edge * holdBars`, and that is what has to clear the cost.
+ *
+ * The hold is drawn from the posterior too: each sample has its own transition
+ * matrix, hence its own expected dwell 1 / (1 - A[k][k]) for the state being
+ * traded. So both the size of the edge and how long it persists are integrated
+ * over, rather than fixed at a point estimate.
  */
 export function posteriorSignal(
   res: McmcResult,
@@ -348,15 +358,31 @@ export function posteriorSignal(
   unscale: (v: number) => number,
   roundTripCost: number,
   credible = 0.9,
-): Interval & { pAboveCost: number } {
-  const draws = res.samples.map((s) => {
+  opts: { holdBars?: number; tradedState?: number } = {},
+): Interval & { pAboveCost: number; perBar: Interval; medianHold: number } {
+  const traded = opts.tradedState ?? res.K - 1;
+
+  const perBarDraws: number[] = [];
+  const tradeDraws: number[] = [];
+  const holds: number[] = [];
+
+  for (const s of res.samples) {
     let e = 0;
     for (let k = 0; k < res.K; k++) e += stateProbs[k] * unscale(s.mu[k * res.D]);
-    return e;
-  });
+    perBarDraws.push(e);
+
+    const stay = Math.min(s.A[traded * res.K + traded], 1 - 1e-9);
+    const hold = opts.holdBars ?? 1 / (1 - stay);
+    holds.push(hold);
+    tradeDraws.push(e * hold);
+  }
+
+  holds.sort((a, b) => a - b);
   return {
-    ...summarize(draws, credible),
-    pAboveCost: draws.filter((v) => v > roundTripCost).length / draws.length,
+    ...summarize(tradeDraws, credible),
+    perBar: summarize(perBarDraws, credible),
+    medianHold: holds[Math.floor(holds.length / 2)],
+    pAboveCost: tradeDraws.filter((v) => v > roundTripCost).length / tradeDraws.length,
   };
 }
 

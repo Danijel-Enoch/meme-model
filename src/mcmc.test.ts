@@ -184,6 +184,22 @@ describe("signal posterior", () => {
     expect(s.median).toBeGreaterThan(0);
   });
 
+  test("the hurdle is compared against edge x hold, not one bar's edge", () => {
+    const s = posteriorSignal(res, [0, 0, 1], (v) => v, 0);
+    // A persistent state holds for many bars, so the trade-level edge must
+    // exceed the per-bar edge by roughly the dwell time.
+    expect(s.medianHold).toBeGreaterThan(2);
+    expect(s.median).toBeGreaterThan(s.perBar.median);
+    expect(s.median / s.perBar.median).toBeCloseTo(s.medianHold, 0);
+  });
+
+  test("an explicit holdBars overrides the posterior dwell", () => {
+    const a = posteriorSignal(res, [0, 0, 1], (v) => v, 0, 0.9, { holdBars: 1 });
+    const b = posteriorSignal(res, [0, 0, 1], (v) => v, 0, 0.9, { holdBars: 10 });
+    expect(a.medianHold).toBe(1);
+    expect(b.median / a.median).toBeCloseTo(10, 4);
+  });
+
   test("an unreachable cost makes P(above cost) zero", () => {
     const s = posteriorSignal(res, [0, 0, 1], (v) => v, 1e9);
     expect(s.pAboveCost).toBe(0);

@@ -993,9 +993,10 @@ async function cmdPosterior(f: Flags) {
   const nx = predictNext(alpha, (fs.T - 1) * states, em.params);
   const sig = posteriorSignal(res, Array.from(nx), un, roundTrip, 0.9);
   console.log(`\n  Signal at the last bar (blended over the state belief)`);
-  console.log(`    median ${b(sig.median)}bps   90% CI [${b(sig.lower)}, ${b(sig.upper)}]bps`);
-  console.log(`    P(edge > 0)          ${(sig.pPositive * 100).toFixed(1)}%`);
-  console.log(`    P(edge > round trip) ${(sig.pAboveCost * 100).toFixed(1)}%`);
+  console.log(`    per bar        median ${b(sig.perBar.median)}bps   90% CI [${b(sig.perBar.lower)}, ${b(sig.perBar.upper)}]bps`);
+  console.log(`    x ${sig.medianHold.toFixed(1)} bars held  ->  ${b(sig.median)}bps   90% CI [${b(sig.lower)}, ${b(sig.upper)}]bps`);
+  console.log(`    P(edge > 0)                    ${(sig.pPositive * 100).toFixed(1)}%`);
+  console.log(`    P(edge x hold > round trip)    ${(sig.pAboveCost * 100).toFixed(1)}%`);
   console.log(sig.pAboveCost < 0.5
     ? "    => not worth taking: the posterior does not favour clearing costs."
     : "    => the posterior favours clearing costs.");
