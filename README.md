@@ -19,7 +19,7 @@ machinery that establishes that rather than hiding it. See [Results](#results).
 ```bash
 bun install
 bun run demo      # synthetic end-to-end walkthrough
-bun test          # 127 tests, incl. brute-force validation of both models
+bun test          # 113 tests, incl. brute-force validation of both models
 ```
 
 Hyperliquid perps — clean data, 4.5bps taker, no API key:
@@ -204,107 +204,10 @@ null pays an entry and exit almost every bar — any low-turnover strategy then
 **rotation** preserves every run and therefore exact turnover, changing only
 *when* the series applies. Rotation is the default whenever `--cost` > 0.
 
-**`montecarlo`** — runs the *entire* pipeline against series that provably
-contain no timing signal, and counts how often it declares victory. This
-calibrates every other number in the repo. See the results below.
-
 **`ceiling`** — what perfect foresight earns here, at each cost. If an oracle
 that knows the future cannot clear your fee, no model can and you should stop.
 It also says the opposite: on `$WIF/SOL` 1h an oracle committing 20 bars at a
 time makes **+271% after 30bps**, so the money is unambiguously there.
-
-### What the Monte Carlo found
-
-Null series keep the marginal return distribution, the fat tails and the
-return/volume relationship, and destroy only the temporal order. Running the
-full confluence pipeline plus permutation test over 100 of them:
-
-| | iid shuffle | block shuffle (keeps vol clustering) |
-| --- | --- | --- |
-| single-series false-positive rate | **4.1%** | **3.4%** |
-| nominal | 5% | 5% |
-
-**The permutation test is honestly calibrated on one series.** A p-value of
-0.04 on a single market means what it says.
-
-Scanning is what destroys it:
-
-```
-  scan  5 markets, report the best:   4/19 batches "significant" on pure noise
-  scan 10 markets, report the best:   3/9  batches "significant"  (33%)
-  scan 20 markets, report the best:   3/4  batches "significant"  (75%)
-```
-
-This repo scanned 9–10 markets repeatedly. At that width, a third of scans
-produce a p < 0.05 result from noise alone — which is precisely the rate at
-which the three "significant" hits (SOL, ETH, XRP) appeared, and exactly why
-none of them survived a split-half test.
-
-The best null run returned **+74.5%**. Any single impressive backtest in this
-domain is consistent with nothing at all.
-
-## Posterior (`posterior`)
-
-Every other command plugs EM's point estimates for `mu_k` into the signal as
-though they were known. They are not: a rare pump state might own 200 of 3000
-bars, and its mean return has a standard error. A Gibbs sampler — forward-filter
-backward-sample for the state path, conjugate Dirichlet and Normal-Inverse-Gamma
-draws for the parameters — puts credible intervals on both the parameters and on
-the signal itself.
-
-Correctness rests on a check worth stating: averaging many FFBS draws converges
-to the smoothed posterior from `posteriors()`, which is itself validated against
-brute-force enumeration. Labels are re-sorted by mean return every sweep, because
-otherwise label switching turns the averaged posterior into mush.
-
-### What the posterior found
-
-The hurdle a signal must clear is the round trip, paid once. The edge is
-per-bar and accumulates over the hold, so the comparison is
-`edge x holdBars > roundTrip` — testing one bar's edge against the whole round
-trip is the same category error that `--duration-aware` exists to avoid. Both
-the edge and the dwell are drawn from the posterior.
-
-Evaluated at the last bar of each series:
-
-| dataset | per-bar edge | hold | edge x hold, 90% CI | round trip | P(clears) |
-| --- | --- | --- | --- | --- | --- |
-| synthetic 5m | −1.5bps | 6.8b | [−39.3, 13.5] bps | 60bps | 0.0% |
-| SOL-PERP 1h | +0.3bps | 7.5b | [−14.5, 19.9] bps | 9bps | 24.5% |
-| BTC-PERP 1h | −0.5bps | 8.2b | [−13.8, 3.2] bps | 9bps | 0.5% |
-| USELESS/SOL 5m | +3.2bps | 7.6b | [−7.5, 61.0] bps | 60bps | 5.5% |
-
-The intervals straddle zero everywhere. Even where the point estimate looks
-healthy — USELESS at +26bps a trade — the 90% interval runs from −7.5 to +61,
-so the model does not know whether the trade has an edge at all.
-
-**A high P(clears) is not a green light.** On the meme coins, JUGGERNAUT scored
-89.7% at a 60bps round trip and its realised confluence ROI was **−49.8%**
-against +1.8% for buy and hold. The posterior is a statement about the
-*expected* return conditional on the state belief being right; realised returns
-are dominated by per-bar volatility of 60–360bps, and the state belief is the
-part that has consistently failed.
-
-### Where the uncertainty actually lives
-
-It is not the parameters. Knowing the state would be worth plenty:
-
-```
-  dataset          mu_bull  dwell   edge if certain   mean blended   round trip
-  synthetic 5m     44.6bps     7b           300bps        5.97bps         60bps
-  SOL-PERP 1h       4.9bps     8b            37bps        0.95bps          9bps
-  BTC-PERP 1h       2.8bps     8b            22bps        0.63bps          9bps
-  USELESS 5m        4.2bps     6b            27bps        2.67bps         60bps
-```
-
-"Edge if certain" clears the round trip almost everywhere. What the model
-actually trades is `sum_k P(k) * mu_k`, and diffuse state beliefs dilute that to
-under 6bps. Peak confidence reaches only 85–88%, and rarely.
-
-So the binding constraint is **state identification**, not parameter estimation
-and not cost. That is the sharpest statement of the problem this repo has
-produced, and it points at the same place everything else did: you need
-information beyond past price to know which regime you are in.
 
 ## Account simulation
 
@@ -437,8 +340,6 @@ src/perp.ts         leveraged account: notional fees, funding, liquidation
 src/diagnostics.ts  permutation test (shuffle/rotate nulls), ceiling analysis
 src/mcmc.ts         Bayesian HMM by Gibbs sampling: FFBS, conjugate draws,
                     credible intervals on parameters and on the signal
-src/montecarlo.ts   null-series generation, pipeline false-positive rate,
-                    trade bootstrap for outcome distributions
 src/hyperliquid.ts  perp candles, funding, market list
 src/sources.ts      GeckoTerminal + DexScreener, paging, gaps, cache
 src/data.ts         CSV parsing, synthetic regime-switching generator
@@ -461,7 +362,6 @@ confluence  3-timeframe scalping stack
 trades      trade ledger + ROI by 24h / 5d / 1w / 2w window
 account     dollar P&L for a leveraged perp account
 validate    is the return skill, or exposure?
-montecarlo  how often does this pipeline cry wolf? plus outcome bootstrap
 posterior   credible intervals on the state means and on the edge
 ceiling     what would perfect foresight earn here?
 demo        synthetic end-to-end walkthrough
@@ -482,7 +382,6 @@ Confluence  --factors 12,3,1  --gate 0  --trigger 0  --bias-confidence 0
             --no-flip-exit
 Account     --equity 50  --leverage 2  --days 14  --single  --min-order 10
 Diagnostics --trials 1000  --costs 0,10,30  --holds 1,5,20  --show 15
-MonteCarlo  --nulls 100  --block 50  --no-bootstrap
 Posterior   --iterations 1200  --burn-in <n>  --thin 3  --kappa0 0.5
 Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
 ```
@@ -502,9 +401,12 @@ Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
   Lower `--max-duration` if that bites; 30 was as good as 60 in testing.
 - Hyperliquid retains ~5000 candles per interval, so 5m gives ~17 days and 1h
   gives ~208. Pick the interval for the history you need.
-- One backtest is one draw. Bootstrapping the $50 @ 2x ledgers, a run that
-  reported $81.21 sat in a 5th-95th range of **$38.86 to $241.79**. With fewer
-  than a few dozen trades the headline number carries almost no information.
+- One backtest is one draw. With fewer than a few dozen trades the headline
+  number carries almost no information — removing four leading bars from one
+  5004-bar series flipped a result from +33.4% to 0.0%.
+- `validate` is calibrated for ONE test on ONE market. Scanning many markets and
+  reporting the best is a different experiment, and its p-values are not the
+  ones printed. Divide your alpha by how many you tried.
 - Past backtest ROI does not predict future ROI. Measured across 9 tokens split
   into halves, rank correlation was **0.033**, while correlation between
   strategy ROI and buy & hold was **0.950** — the "high ROI" names are simply
