@@ -146,7 +146,7 @@ export function forward(logB: Float64Array, T: number, p: HmmParams): ForwardRes
 }
 
 /** Scaled backward pass, paired with the normalized alphas above. */
-function backward(logB: Float64Array, T: number, p: HmmParams): Float64Array {
+export function backward(logB: Float64Array, T: number, p: HmmParams): Float64Array {
   const { K, A } = p;
   const beta = new Float64Array(T * K);
   const b = new Float64Array(K);

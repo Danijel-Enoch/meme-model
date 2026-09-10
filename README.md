@@ -19,7 +19,7 @@ machinery that establishes that rather than hiding it. See [Results](#results).
 ```bash
 bun install
 bun run demo      # synthetic end-to-end walkthrough
-bun test          # 113 tests, incl. brute-force validation of both models
+bun test          # 137 tests, incl. brute-force validation of both models
 ```
 
 Hyperliquid perps — clean data, 4.5bps taker, no API key:
@@ -209,6 +209,96 @@ that knows the future cannot clear your fee, no model can and you should stop.
 It also says the opposite: on `$WIF/SOL` 1h an oracle committing 20 bars at a
 time makes **+271% after 30bps**, so the money is unambiguously there.
 
+## Two ways to a posterior
+
+Everything above plugs EM's point estimates into the signal as if they were
+known. `mu_k` is estimated from however many bars happened to land in state k,
+and a rare pump state might own 200 of 3000. If its standard error is
+comparable to the round trip, the signal is noise wearing a point estimate.
+`posterior` puts credible intervals on that, and on the traded quantity itself.
+
+Two engines answer it, on the same model with the same conjugate priors, so
+they are directly comparable.
+
+**Variational EM** (default, `src/vb.ts`). Approximate the intractable
+posterior by a factorized `q(z) q(pi) q(A) q(mu, lambda)` and maximize a lower
+bound on the evidence — the ELBO — by alternating exactly like Baum-Welch:
+
+```
+E step   q(z)      forward-backward, but run on E[log pi], E[log A] and
+                   E[log N(x | mu, 1/lambda)] rather than on point values
+M step   q(theta)  the same conjugate Dirichlet and Normal-Gamma updates the
+                   sampler uses, driven by responsibilities instead of a path
+```
+
+The difference from Baum-Welch is one term. Where EM plugs `mu_k` into the
+Gaussian, VB integrates the density against `q(mu, lambda)`, which adds a
+`-1/(2 kappa_k)` penalty for not knowing the mean. That is what stops a state
+with forty observations from claiming a razor-sharp emission.
+
+Three things fall out that the sampler cannot give:
+
+- **Convergence is a number.** The ELBO is monotone by construction, so
+  "converged" is a tolerance, not a judgement about a trace. It gets there in
+  ~30 iterations against 1200 sweeps — about **9x faster** end to end.
+- **Draws are independent.** `q` is a product of Dirichlets and Normal-Gammas,
+  so the intervals come from i.i.d. draws. No burn-in, no thinning, no
+  autocorrelation discounting the effective sample size.
+- **K stops being an assertion.** The ELBO bounds `log p(x)` for a given K, so
+  ELBOs are comparable across K and `--select-states 2,3,4,5` picks the number
+  of regimes. States that explain nothing take their occupancy to zero and
+  revert exactly to the prior, which is the same answer read off directly.
+
+**Gibbs sampling** (`--gibbs`, `src/mcmc.ts`). Forward-filter-backward-sample
+the state path, then draw parameters from their conjugate conditionals.
+Asymptotically exact, and kept for exactly that reason.
+
+### What the approximation costs
+
+Mean-field assumes `q(z)` and `q(theta)` are independent. They are not, and the
+standard consequence is credible intervals that are too **narrow** — confident
+in proportion to how wrong the independence assumption is.
+
+That is measurable, so it is measured. Twelve independent 800-bar series, 90%
+nominal intervals on all three state means:
+
+```
+             coverage    mean width
+Gibbs             89%         0.150
+variational       83%         0.128
+```
+
+The sampler lands on its nominal rate. The approximation gives up 14% of the
+width and 6 points of coverage for it. Since the whole question this command
+exists to answer is whether an interval clears the round trip, that bias points
+the flattering way — which is why `--gibbs` is still here, why the CLI says so
+after every variational run, and why `vb.test.ts` checks the two against each
+other rather than trusting either alone.
+
+On real data they agree closely. SOL 1h, 1995 bars, bullish-state mean:
+
+```
+variational   [ 1.8, 21.1] bps      29 iterations
+Gibbs         [ 1.4, 20.8] bps    1200 sweeps
+```
+
+### The ELBO does not want three states
+
+Asked to choose on SOL 1h, it picks **six**, and keeps improving until it
+prunes on its own:
+
+```
+K       2       3       4       5       6       8      10      12
+ELBO -3.767  -3.574  -3.428  -3.352  -3.292  -3.299  -3.318  -3.364
+occ      2       3       4       5       6       7       7       7
+```
+
+Read that as a statement about Gaussian emissions, not about markets. A single
+heavy-tailed return distribution is cheaper to approximate with several
+Gaussians than with one, so extra states buy likelihood by modelling the tails
+rather than by finding regimes. The repo defaults to 3 because three states are
+interpretable — chop, bleed, pump — not because the evidence prefers them.
+
 ## Account simulation
 
 `account` reports dollars for a real leveraged perp account, because three
@@ -319,7 +409,7 @@ price: order flow, holder concentration, LP changes, liquidations.
 
 ## Tests
 
-`bun test` — 96 tests. Both models are validated against brute-force
+`bun test` — 137 tests. Both models are validated against brute-force
 enumeration: all `K^T` state paths for the HMM, and every (state, duration)
 segmentation for the HSMM. Forward log-likelihood, filtered marginals, smoothed
 marginals and the Viterbi path must match exactly. Plus EM monotonicity,
@@ -327,6 +417,16 @@ parameter recovery from generated data, causality of filtering and of feature
 construction, multi-timeframe lookahead guards, trade-ledger accounting against
 hand-computed values, and leveraged account accounting including liquidation
 paths.
+
+The variational fit is held to the same standard. `lgamma` and `digamma` are
+checked against closed forms, their recurrences, and each other by finite
+difference; the ELBO must never decrease; a cold start must reach the same
+optimum as an EM warm start; the ELBO must select the true K on data generated
+with a known one; unused states must revert to the prior exactly; the draws
+must be independent (lag-1 autocorrelation under 0.06, which a Gibbs chain
+cannot claim); and the whole posterior is compared against the sampler on the
+same series, including the replication study that measures what the mean-field
+narrowing costs in coverage.
 
 ## Layout
 
@@ -338,8 +438,12 @@ src/confluence.ts   multi-timeframe stack, completed-bar alignment
 src/backtest.ts     walk-forward harness, signal, trade ledger, metrics
 src/perp.ts         leveraged account: notional fees, funding, liquidation
 src/diagnostics.ts  permutation test (shuffle/rotate nulls), ceiling analysis
-src/mcmc.ts         Bayesian HMM by Gibbs sampling: FFBS, conjugate draws,
-                    credible intervals on parameters and on the signal
+src/vb.ts           Bayesian HMM by variational EM: ELBO, expected-log-parameter
+                    forward-backward, conjugate M step, K selection, i.i.d. draws
+src/mcmc.ts         Bayesian HMM by Gibbs sampling: FFBS, conjugate draws.
+                    The exact reference the variational fit is checked against
+src/posterior.ts    shared by both engines: priors, conjugate draws, credible
+                    intervals on parameters, on dwell times and on the signal
 src/hyperliquid.ts  perp candles, funding, market list
 src/sources.ts      GeckoTerminal + DexScreener, paging, gaps, cache
 src/data.ts         CSV parsing, synthetic regime-switching generator
@@ -363,6 +467,7 @@ trades      trade ledger + ROI by 24h / 5d / 1w / 2w window
 account     dollar P&L for a leveraged perp account
 validate    is the return skill, or exposure?
 posterior   credible intervals on the state means and on the edge
+            (variational EM by default, --gibbs for the sampler)
 ceiling     what would perfect foresight earn here?
 demo        synthetic end-to-end walkthrough
 ```
@@ -382,7 +487,8 @@ Confluence  --factors 12,3,1  --gate 0  --trigger 0  --bias-confidence 0
             --no-flip-exit
 Account     --equity 50  --leverage 2  --days 14  --single  --min-order 10
 Diagnostics --trials 1000  --costs 0,10,30  --holds 1,5,20  --show 15
-Posterior   --iterations 1200  --burn-in <n>  --thin 3  --kappa0 0.5
+Posterior   --select-states 2,3,4,5  --draws 4000  --kappa0 0.5
+            --gibbs  --iterations 1200  --burn-in <n>  --thin 3
 Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
 ```
 
@@ -395,8 +501,9 @@ Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
   this, gate on `P(edge x hold > round trip)` rather than on the plugged-in
   mean — and remember that clearing the hurdle in expectation says nothing about
   the variance of any individual trade.
-- `K` is fixed, not selected. Compare log-likelihood per bar across `--states`
-  with a BIC-style penalty if you want to choose it properly.
+- `K` defaults to 3 everywhere except `posterior --select-states`, which picks
+  it by ELBO. Read the section above before believing the number it returns:
+  on real series it selects for tail-fitting as much as for regimes.
 - The HSMM costs roughly 15x the HMM to fit (O(T·K·maxDuration) per EM sweep).
   Lower `--max-duration` if that bites; 30 was as good as 60 in testing.
 - Hyperliquid retains ~5000 candles per interval, so 5m gives ~17 days and 1h

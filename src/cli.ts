@@ -16,7 +16,12 @@ import { permutationTest, ceilingAnalysis, tradedSeries } from "./diagnostics";
 import { walkForwardConfluence, DEFAULT_STACK, type TimeframeSpec } from "./confluence";
 import * as hl from "./hyperliquid";
 import { simulatePerp } from "./perp";
-import { runMcmc, posteriorStateMeans, posteriorDurations, posteriorSignal, DEFAULT_PRIORS } from "./mcmc";
+import { runMcmc } from "./mcmc";
+import { fitVb, selectStates } from "./vb";
+import {
+  posteriorStateMeans, posteriorDurations, posteriorSignal, DEFAULT_PRIORS,
+  type PosteriorDraws,
+} from "./posterior";
 
 type Flags = Record<string, string | boolean>;
 
@@ -822,12 +827,18 @@ async function cmdAccount(f: Flags) {
 }
 
 /**
- * Bayesian posterior over the model, by Gibbs sampling.
+ * Bayesian posterior over the model.
  *
  * Every other command plugs EM's point estimates into the signal as if they
  * were known. This puts credible intervals on them and, more usefully, on the
  * signal itself — so the question becomes "what is the probability the expected
  * move clears the round trip", which is the one a trader actually has.
+ *
+ * Two engines answer it. Variational EM (default) optimizes a bound on the
+ * evidence and reports i.i.d. draws from the fitted approximation; `--gibbs`
+ * runs the sampler instead, which is slower and asymptotically exact. Run both
+ * when a number is about to matter: mean-field variational intervals are known
+ * to come out too narrow, and narrow is the direction that flatters a signal.
  */
 async function cmdPosterior(f: Flags) {
   const ds = await getDataSet(f);
@@ -836,29 +847,70 @@ async function cmdPosterior(f: Flags) {
     useVolatility: !bool(f, "no-vol"),
     useVolume: !bool(f, "no-volume"),
   };
-  const states = num(f, "states", 3);
   const costBps = num(f, "cost", hl.HL_TAKER_BPS);
   const roundTrip = (2 * costBps) / 10_000;
+  const useGibbs = bool(f, "gibbs");
+  const kappa0 = num(f, "kappa0", DEFAULT_PRIORS.kappa0);
+  const draws = num(f, "draws", 4000);
 
   const fs = buildFeatures(ds.candles, featureCfg);
   const scaler = fitScaler(fs.X, fs.T, fs.D);
   const Z = applyScaler(fs.X, fs.T, fs.D, scaler);
 
-  // Warm-start from EM: the chain mixes far better from a sensible segmentation.
-  const em = fit(Z, fs.T, fs.D, { states, restarts: num(f, "restarts", 4), seed: num(f, "seed", 42) });
-  const iterations = num(f, "iterations", 1200);
-  console.log(`\nPosterior for ${ds.label} — ${states} states, ${fs.T} bars`);
-  console.log(`  Gibbs: ${iterations} sweeps, ${num(f, "burn-in", Math.floor(iterations / 2))} burn-in, thin ${num(f, "thin", 3)}`);
-  console.log(`  prior kappa0 = ${num(f, "kappa0", DEFAULT_PRIORS.kappa0)} (shrinkage toward zero drift)\n`);
+  // Let the ELBO pick K when asked. Only variational EM can do this — the
+  // sampler has no comparable quantity, so --select-states forces the engine.
+  let states = num(f, "states", 3);
+  let selection: ReturnType<typeof selectStates> | null = null;
+  const selectSpec = str(f, "select-states");
+  if (selectSpec !== undefined) {
+    const candidates = String(selectSpec).split(",").map((x) => Number(x.trim())).filter((x) => x >= 2);
+    console.log(`\nSelecting the number of regimes by ELBO over K = ${candidates.join(", ")}`);
+    selection = selectStates(Z, fs.T, fs.D, candidates, {
+      seed: num(f, "seed", 11), priors: { kappa0 }, draws: 0,
+    });
+    console.log("    K    ELBO/bar    occupied states");
+    for (const row of selection.scores) {
+      const mark = row.states === selection.best.K ? "  <-" : "";
+      console.log(`   ${String(row.states).padStart(2)}  ${row.elboPerBar.toFixed(5).padStart(10)}  ${String(row.occupied).padStart(10)}${mark}`);
+    }
+    states = selection.best.K;
+  }
 
-  const res = runMcmc(Z, fs.T, fs.D, {
-    states, iterations,
-    burnIn: num(f, "burn-in", Math.floor(iterations / 2)),
-    thin: num(f, "thin", 3),
-    seed: num(f, "seed", 11),
-    init: em.params,
-    priors: { kappa0: num(f, "kappa0", DEFAULT_PRIORS.kappa0) },
-  });
+  // Warm-start from EM. The sampler mixes far better from a sensible
+  // segmentation; variational EM lands in the same place either way but gets
+  // there in a handful of iterations instead of a few dozen.
+  const em = fit(Z, fs.T, fs.D, { states, restarts: num(f, "restarts", 4), seed: num(f, "seed", 42) });
+
+  console.log(`\nPosterior for ${ds.label} — ${states} states, ${fs.T} bars`);
+  let res: PosteriorDraws;
+  if (useGibbs) {
+    const iterations = num(f, "iterations", 1200);
+    console.log(`  Gibbs: ${iterations} sweeps, ${num(f, "burn-in", Math.floor(iterations / 2))} burn-in, thin ${num(f, "thin", 3)}`);
+    console.log(`  prior kappa0 = ${kappa0} (shrinkage toward zero drift)\n`);
+    res = runMcmc(Z, fs.T, fs.D, {
+      states, iterations,
+      burnIn: num(f, "burn-in", Math.floor(iterations / 2)),
+      thin: num(f, "thin", 3),
+      seed: num(f, "seed", 11),
+      init: em.params,
+      priors: { kappa0 },
+    });
+  } else {
+    const vb = fitVb(Z, fs.T, fs.D, {
+      states, init: em.params, draws,
+      maxIter: num(f, "iterations", 300),
+      seed: num(f, "seed", 11),
+      priors: { kappa0 },
+    });
+    const pruned = Array.from(vb.occupancy).filter((n) => n <= 0.01 * fs.T).length;
+    console.log(`  variational EM: ELBO/bar ${(vb.elbo / fs.T).toFixed(5)} after ${vb.iterations} iterations` +
+      ` (${vb.converged ? "converged" : "hit the iteration cap"}), ${draws} independent draws`);
+    if (pruned > 0) {
+      console.log(`  ${pruned} of ${states} states carry almost no occupancy — the data does not support them.`);
+    }
+    console.log(`  prior kappa0 = ${kappa0} (shrinkage toward zero drift)\n`);
+    res = vb;
+  }
 
   const un = (v: number) => unscale(v, 0, scaler);
   const ints = posteriorStateMeans(res, 0, un, 0.9);
@@ -893,6 +945,12 @@ async function cmdPosterior(f: Flags) {
   console.log(sig.pAboveCost < 0.5
     ? "    => not worth taking: the posterior does not favour clearing costs."
     : "    => the posterior favours clearing costs.");
+
+  if (!useGibbs) {
+    console.log("\n  These intervals come from a mean-field approximation, which is biased");
+    console.log("  toward being too narrow. Re-run with --gibbs before acting on a marginal");
+    console.log("  call; if the two disagree, believe the sampler.");
+  }
 
   // Where the uncertainty lives: knowing the state would be worth a lot more.
   const dwell = durs[top].median;
@@ -1211,11 +1269,17 @@ Diagnostics
   --holds 1,5,20      ceiling: bars an oracle commits for
   --trials 1000       validate: number of shuffles
 
-Posterior (Bayesian HMM by Gibbs sampling)
-  --iterations 1200   sweeps; half are burn-in by default
-  --burn-in <n>       override the burn-in
-  --thin 3            keep every nth post-burn-in draw
+Posterior (Bayesian HMM; variational EM by default)
+  --select-states 2,3,4,5   pick the number of regimes by ELBO
+  --draws 4000        independent draws from the variational posterior
+  --iterations 300    cap on variational EM iterations
   --kappa0 0.5        prior strength pulling state means toward zero drift
+  --gibbs             use the sampler instead. Slower, asymptotically exact,
+                      and the thing to check a marginal call against — mean-field
+                      credible intervals come out too narrow.
+  --iterations 1200   --gibbs: sweeps; half are burn-in by default
+  --burn-in <n>       --gibbs: override the burn-in
+  --thin 3            --gibbs: keep every nth post-burn-in draw
 
 Account simulation (perps only)
   --equity 50         starting margin in USD

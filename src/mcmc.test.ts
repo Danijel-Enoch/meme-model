@@ -1,8 +1,9 @@
 import { expect, test, describe } from "bun:test";
+import { runMcmc, ffbs } from "./mcmc";
 import {
-  runMcmc, ffbs, sampleGamma, sampleDirichlet, sampleInvGamma,
+  sampleGamma, sampleDirichlet, sampleInvGamma,
   posteriorStateMeans, posteriorSignal, posteriorMeanParams, DEFAULT_PRIORS,
-} from "./mcmc";
+} from "./posterior";
 import { fit, posteriors, makeRng, randn, type HmmParams } from "./hmm";
 
 function toyModel(): HmmParams {
