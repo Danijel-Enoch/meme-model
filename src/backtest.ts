@@ -92,15 +92,25 @@ export interface BacktestResult {
  * which is underneath. Both expose a *causal* one-step-ahead state forecast:
  * row i of `nextProb` uses observations up to and including row i, never past it.
  */
-interface FittedModel {
+interface ModelView {
   K: number;
-  logLik: number;
   meanReturns: number[];
   vols: number[] | null;
   durations: number[];
-  /** n*K one-step-ahead state probabilities across the supplied span. */
-  nextProb(Z: Float64Array, n: number): Float64Array;
+  /**
+   * Causal beliefs across the supplied span, in one pass:
+   *   stateProb row i = P(z_i | x_0..i)   — filtered, never smoothed
+   *   nextProb  row i = P(z_{i+1} | x_0..i)
+   * Both are folds from the left, so running them over a prefix of the span
+   * reproduces the earlier rows bit for bit. That is what lets a live signal
+   * over candles[0..t] equal the backtest's row t.
+   */
+  predict(Z: Float64Array, n: number): { stateProb: Float64Array; nextProb: Float64Array };
   params: HmmParams | HsmmParams;
+}
+
+interface FittedModel extends ModelView {
+  logLik: number;
 }
 
 /** Per-state mean log return, converted back into real units. */
@@ -109,10 +119,73 @@ export function stateMeanReturns(p: HmmParams, s: Scaler): number[] {
 }
 
 /** Per-state expected volatility per bar, if the vol feature is present. */
-function stateVols(p: HmmParams, s: Scaler, names: string[]): number[] | null {
+function stateVols(p: HmmParams | HsmmParams, s: Scaler, names: string[]): number[] | null {
   const d = names.indexOf("realizedVol");
   if (d < 0) return null;
   return Array.from({ length: p.K }, (_, k) => Math.exp(unscale(p.mu[k * p.D + d], d, s)));
+}
+
+/**
+ * Everything the harness reads off a parameter set, for either model type.
+ *
+ * Split out of `fitModel` deliberately: paper trading has to derive its signal
+ * from SAVED parameters without refitting anything, and the only way to be sure
+ * it produces the backtest's decision is for both to go through this one
+ * function. Duplicating the mu/duration/filter dispatch is how live and
+ * backtest silently drift apart.
+ */
+function describeModel(
+  params: HmmParams | HsmmParams, modelType: ModelType, scaler: Scaler, names: string[],
+): ModelView {
+  const meanReturns = stateMeanReturns(params as HmmParams, scaler);
+  const vols = stateVols(params, scaler, names);
+
+  if (modelType === "hsmm") {
+    const p = params as HsmmParams;
+    return {
+      K: p.K, params, meanReturns, vols,
+      durations: expectedDurations(p),
+      predict: (Z, len) => {
+        const f = filterHsmm(Z, len, p);
+        return { stateProb: f.stateProb, nextProb: f.nextProb };
+      },
+    };
+  }
+
+  const p = params as HmmParams;
+  return {
+    K: p.K, params, meanReturns, vols,
+    durations: Array.from({ length: p.K }, (_, k) => expectedDuration(p, k)),
+    predict: (Z, len) => {
+      const { alpha } = filter(Z, len, p);
+      const out = new Float64Array(len * p.K);
+      for (let t = 0; t < len; t++) {
+        const nx = predictNext(alpha, t * p.K, p);
+        for (let k = 0; k < p.K; k++) out[t * p.K + k] = nx[k];
+      }
+      return { stateProb: alpha, nextProb: out };
+    },
+  };
+}
+
+/**
+ * Fill in the strategy defaults. Shared by `walkForward` and `signalNow` so a
+ * live signal cannot be decided against different thresholds than the study it
+ * is supposed to be reproducing.
+ */
+function resolveStrategy(strategy: StrategyConfig): Required<StrategyConfig> {
+  return {
+    // Default the entry bar to a round trip: taking a signal whose expected edge
+    // is smaller than the cost of expressing it is the fastest way to bleed out.
+    costBps: strategy.costBps ?? 30,
+    entryBps: strategy.entryBps ?? 2 * (strategy.costBps ?? 30),
+    exitBps: strategy.exitBps ?? 0,
+    allowShort: strategy.allowShort ?? false,
+    volTarget: strategy.volTarget ?? 0,
+    maxPosition: strategy.maxPosition ?? 1,
+    confidence: strategy.confidence ?? 0,
+    durationAware: strategy.durationAware ?? false,
+  };
 }
 
 function decidePosition(
@@ -148,39 +221,11 @@ function fitModel(
       states, seed, restarts: wf.restarts ?? 4,
       maxDuration: wf.maxDuration ?? 60,
     });
-    const p = res.params;
-    return {
-      K: p.K, logLik: res.logLik, params: p,
-      meanReturns: Array.from({ length: p.K }, (_, k) => unscale(p.mu[k * p.D], 0, scaler)),
-      vols: hsmmVols(p, scaler, names),
-      durations: expectedDurations(p),
-      nextProb: (Z, len) => filterHsmm(Z, len, p).nextProb,
-    };
+    return { ...describeModel(res.params, "hsmm", scaler, names), logLik: res.logLik };
   }
 
   const res = fit(trainZ, n, D, { states, seed, restarts: wf.restarts ?? 4, verbose: false });
-  const p = res.params;
-  return {
-    K: p.K, logLik: res.logLik, params: p,
-    meanReturns: stateMeanReturns(p, scaler),
-    vols: stateVols(p, scaler, names),
-    durations: Array.from({ length: p.K }, (_, k) => expectedDuration(p, k)),
-    nextProb: (Z, len) => {
-      const { alpha } = filter(Z, len, p);
-      const out = new Float64Array(len * p.K);
-      for (let t = 0; t < len; t++) {
-        const nx = predictNext(alpha, t * p.K, p);
-        for (let k = 0; k < p.K; k++) out[t * p.K + k] = nx[k];
-      }
-      return out;
-    },
-  };
-}
-
-function hsmmVols(p: HsmmParams, s: Scaler, names: string[]): number[] | null {
-  const d = names.indexOf("realizedVol");
-  if (d < 0) return null;
-  return Array.from({ length: p.K }, (_, k) => Math.exp(unscale(p.mu[k * p.D + d], d, s)));
+  return { ...describeModel(res.params, "hmm", scaler, names), logLik: res.logLik };
 }
 
 export interface Trade {
@@ -309,18 +354,7 @@ export function walkForward(
   strategy: StrategyConfig = {},
   wf: WalkForwardConfig = {},
 ): BacktestResult {
-  const cfg: Required<StrategyConfig> = {
-    // Default the entry bar to a round trip: taking a signal whose expected edge
-    // is smaller than the cost of expressing it is the fastest way to bleed out.
-    costBps: strategy.costBps ?? 30,
-    entryBps: strategy.entryBps ?? 2 * (strategy.costBps ?? 30),
-    exitBps: strategy.exitBps ?? 0,
-    allowShort: strategy.allowShort ?? false,
-    volTarget: strategy.volTarget ?? 0,
-    maxPosition: strategy.maxPosition ?? 1,
-    confidence: strategy.confidence ?? 0,
-    durationAware: strategy.durationAware ?? false,
-  };
+  const cfg = resolveStrategy(strategy);
   const trainSize = wf.trainSize ?? 1500;
   const testSize = wf.testSize ?? 500;
   const barsPerYear = wf.barsPerYear ?? 105_120; // 5-minute bars
@@ -359,7 +393,7 @@ export function walkForward(
     // Run the model across train+test so the test block inherits a warmed-up
     // belief, while row i still depends on rows <= i only.
     const spanZ = applyScaler(X.slice(start * D, testEnd * D), testEnd - start, D, scaler);
-    const pred = model.nextProb(spanZ, testEnd - start);
+    const pred = model.predict(spanZ, testEnd - start).nextProb;
 
     let prev = 0;
     for (let i = trainEnd; i < testEnd; i++) {
@@ -461,5 +495,88 @@ export function walkForward(
     stateProbs,
     refits,
     lastModel,
+  };
+}
+
+export interface LiveSignal {
+  /** Target position in [-1, 1], the same quantity walkForward stores in positions[]. */
+  target: number;
+  /** Blended expected next-bar return, real units (not bps, not scaled). */
+  expectedReturn: number;
+  /** The dwell the model expects for its most bullish state — the hold the
+   *  duration-aware entry threshold is spread across. */
+  expectedHoldBars: number;
+  /** One-step-ahead state distribution at the last bar. */
+  stateProbs: number[];
+  /** Most likely CURRENT state (filtered, not smoothed). */
+  state: number;
+  /** Per-state mean returns, real units, for display. */
+  stateMeans: number[];
+}
+
+/**
+ * The decision the walk-forward harness would take on the LAST supplied bar.
+ *
+ * Paper trading is only evidence about the model if it produces the model's
+ * decision, so this shares `describeModel`, `resolveStrategy` and
+ * `decidePosition` with `walkForward` rather than restating any of them. Two
+ * things it deliberately does not do:
+ *
+ *   It never refits the scaler. Standardizing live candles against their own
+ *   mean and standard deviation leaks the future into every past bar — the
+ *   scaler handed in here is the one frozen at training time.
+ *
+ *   It never smooths. `predict` returns the filtered belief, so the answer for
+ *   bar t is identical whether or not bars after t exist yet. That is what makes
+ *   calling this once per closed bar equivalent to the backtest's inner loop.
+ */
+export function signalNow(
+  params: HmmParams | HsmmParams,
+  modelType: ModelType,
+  scaler: Scaler,
+  names: string[],
+  candles: Candle[],
+  featureConfig: FeatureConfig,
+  strategy: StrategyConfig,
+  prevPosition: number,
+): LiveSignal {
+  const cfg = resolveStrategy(strategy);
+  const fs = buildFeatures(candles, featureConfig);
+  // SAVED scaler, applied — never fitted here.
+  const Z = applyScaler(fs.X, fs.T, fs.D, scaler);
+
+  const model = describeModel(params, modelType, scaler, names);
+  const { stateProb, nextProb } = model.predict(Z, fs.T);
+  const K = model.K;
+  const last = fs.T - 1;
+
+  let expR = 0;
+  let expVol = 0;
+  let state = 0;
+  let best = -Infinity;
+  const row: number[] = [];
+  for (let k = 0; k < K; k++) {
+    const pk = nextProb[last * K + k];
+    row.push(pk);
+    expR += pk * model.meanReturns[k];
+    if (model.vols) expVol += pk * model.vols[k];
+    const f = stateProb[last * K + k];
+    if (f > best) { best = f; state = k; }
+  }
+
+  // Expected hold = how long the model thinks the most bullish state lasts,
+  // exactly as the walk-forward loop reads it.
+  const holdBars = model.durations[K - 1] ?? 1;
+  const target = cfg.confidence > 0
+    ? (row[K - 1] > cfg.confidence ? 1 : 0)
+    : decidePosition(expR, model.vols ? expVol : null, prevPosition, cfg, holdBars);
+
+  return {
+    target,
+    expectedReturn: expR,
+    expectedHoldBars: holdBars,
+    stateProbs: row,
+    state,
+    stateMeans: model.meanReturns,
   };
 }

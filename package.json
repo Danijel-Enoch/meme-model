@@ -9,10 +9,15 @@
     "train": "bun run src/cli.ts train",
     "backtest": "bun run src/cli.ts backtest",
     "predict": "bun run src/cli.ts predict",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "tui": "bun run src/tui/index.ts",
+    "sweep": "bun run src/cli.ts sweep"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "^5.6.0"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.5.11"
   }
 }

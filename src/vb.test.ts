@@ -1,9 +1,13 @@
 import { expect, test, describe } from "bun:test";
 import {
-  fitVb, selectStates, vbMeanParams, vbPosteriors, drawFromQ, digamma, lgamma,
+  fitVb, fitVbHsmm, selectStates, selectStatesHsmm, vbMeanParams, vbPosteriors,
+  drawFromQ, digamma, lgamma,
 } from "./vb";
 import { runMcmc } from "./mcmc";
-import { posteriorStateMeans, posteriorDurations, DEFAULT_PRIORS } from "./posterior";
+import { fitHsmm, expectedDurations, type HsmmParams } from "./hsmm";
+import {
+  posteriorStateMeans, posteriorDurations, posteriorSignal, DEFAULT_PRIORS,
+} from "./posterior";
 import { fit, makeRng, randn, type HmmParams } from "./hmm";
 
 function toyModel(): HmmParams {
@@ -349,5 +353,150 @@ describe("variational EM against the Gibbs sampler", () => {
     for (let k = 0; k < 3; k++) {
       expect(Math.abs(v[k].median - g[k].median) / g[k].median).toBeLessThan(0.25);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+function fixedDurationHsmm(dwellBars: number, maxDuration: number): HsmmParams {
+  const K = 2;
+  const dur = new Float64Array(K * maxDuration);
+  for (let j = 0; j < K; j++) dur[j * maxDuration + (dwellBars - 1)] = 1;
+  return {
+    K, D: 1, maxDuration,
+    pi: new Float64Array([0.5, 0.5]),
+    A: new Float64Array([0, 1, 1, 0]),
+    mu: new Float64Array([-1.5, 1.5]),
+    vari: new Float64Array([0.3, 0.3]),
+    dur,
+  };
+}
+
+function sampleHsmm(p: HsmmParams, T: number, seed: number) {
+  const rng = makeRng(seed);
+  const X = new Float64Array(T);
+  const states = new Int32Array(T);
+  let t = 0, prev = -1;
+  while (t < T) {
+    let j = 0, acc = 0;
+    const u = rng();
+    const row = prev < 0 ? p.pi : p.A.subarray(prev * p.K, (prev + 1) * p.K);
+    for (let k = 0; k < p.K; k++) { acc += row[k]; if (u <= acc) { j = k; break; } }
+    const ud = rng();
+    let da = 0, d = 1;
+    for (let dd = 1; dd <= p.maxDuration; dd++) {
+      da += p.dur[j * p.maxDuration + (dd - 1)];
+      if (ud <= da) { d = dd; break; }
+    }
+    for (let k = 0; k < d && t < T; k++, t++) {
+      states[t] = j;
+      X[t] = p.mu[j] + Math.sqrt(p.vari[j]) * randn(rng);
+    }
+    prev = j;
+  }
+  return { X, states };
+}
+
+describe("semi-Markov variational EM", () => {
+  const maxDuration = 16;
+  const truth = fixedDurationHsmm(8, maxDuration);
+  const T = 2000;
+  const { X } = sampleHsmm(truth, T, 8);
+
+  test("the ELBO never decreases", () => {
+    // Cold start, so the bound has a long way to climb and plenty of chances
+    // to stumble on the way.
+    const res = fitVbHsmm(X, T, 1, { states: 2, maxDuration, seed: 11, draws: 0, maxIter: 60 });
+    expect(res.elboTrace.length).toBeGreaterThan(2);
+    for (let i = 1; i < res.elboTrace.length; i++) {
+      expect(res.elboTrace[i]).toBeGreaterThanOrEqual(res.elboTrace[i - 1] - 1e-6);
+    }
+  });
+
+  test("recovers a duration law the geometric model cannot express", () => {
+    const em = fitHsmm(X, T, 1, { states: 2, maxDuration, restarts: 3, seed: 7 });
+    const res = fitVbHsmm(X, T, 1, { states: 2, maxDuration, init: em.params, seed: 11, draws: 1500 });
+
+    // Posterior mean pmf: mass on 8, not decaying from 1 like a geometric.
+    for (let j = 0; j < 2; j++) {
+      const pmf = res.meanParams.dur.subarray(j * maxDuration, (j + 1) * maxDuration);
+      let mode = 0;
+      for (let d = 1; d < maxDuration; d++) if (pmf[d] > pmf[mode]) mode = d;
+      expect(mode + 1).toBe(8);
+    }
+
+    // And the credible interval on dwell brackets the truth.
+    const durs = posteriorDurations(res, 0.9);
+    for (const d of durs) {
+      expect(d.lower).toBeLessThanOrEqual(8);
+      expect(d.upper).toBeGreaterThanOrEqual(8);
+      expect(Math.abs(d.median - 8)).toBeLessThan(0.5);
+    }
+  });
+
+  test("dwell comes from the duration pmf, not the zeroed diagonal", () => {
+    // Every draw's A has a zero diagonal, so the geometric reading would say
+    // 1 / (1 - 0) = 1 bar for every state. The `dwell` rows are what stop that.
+    const res = fitVbHsmm(X, T, 1, { states: 2, maxDuration, seed: 11, draws: 400 });
+    for (const s of res.samples) for (let k = 0; k < 2; k++) expect(s.A[k * 2 + k]).toBe(0);
+    for (const d of posteriorDurations(res, 0.9)) expect(d.median).toBeGreaterThan(5);
+
+    // The traded hold in the signal is that same dwell, which is the number the
+    // round-trip comparison is most sensitive to.
+    const sig = posteriorSignal(res, [0, 1], (v) => v, 0);
+    expect(sig.medianHold).toBeGreaterThan(5);
+  });
+
+  test("beats the Markov bound on non-geometric durations", () => {
+    // Both bound log p(x) for the same data, so the comparison is meaningful.
+    const semi = fitVbHsmm(X, T, 1, { states: 2, maxDuration, seed: 11, draws: 0 });
+    const markov = fitVb(X, T, 1, { states: 2, seed: 11, draws: 0 });
+    expect(semi.elbo).toBeGreaterThan(markov.elbo);
+  });
+
+  test("prunes states the data does not support", () => {
+    const res = fitVbHsmm(X, T, 1, { states: 4, maxDuration, seed: 11, draws: 0, maxIter: 80 });
+    const occupied = Array.from(res.occupancy).filter((n) => n > 0.01 * T).length;
+    expect(occupied).toBe(2);
+  });
+
+  test("selectStatesHsmm picks the true number of regimes", () => {
+    const sel = selectStatesHsmm(X, T, 1, [2, 3], { maxDuration, seed: 11, draws: 0, maxIter: 60 });
+    expect(sel.best.K).toBe(2);
+    expect(sel.scores.map((s) => s.states)).toEqual([2, 3]);
+  });
+
+  test("draws are proper distributions", () => {
+    const res = fitVbHsmm(X, T, 1, { states: 2, maxDuration, seed: 3, draws: 25 });
+    for (const s of res.samples) {
+      let pi = 0;
+      for (let k = 0; k < 2; k++) pi += s.pi[k];
+      expect(pi).toBeCloseTo(1, 8);
+      for (let i = 0; i < 2; i++) {
+        let row = 0, dsum = 0;
+        for (let j = 0; j < 2; j++) row += s.A[i * 2 + j];
+        for (let d = 0; d < maxDuration; d++) dsum += s.dur[i * maxDuration + d];
+        expect(row).toBeCloseTo(1, 8);
+        expect(dsum).toBeCloseTo(1, 8);
+      }
+      // Relabelled: state 1 is the bullish one in every draw.
+      expect(s.mu[1]).toBeGreaterThan(s.mu[0]);
+    }
+  });
+
+  test("agrees with the maximum-likelihood fit it was seeded from", () => {
+    const em = fitHsmm(X, T, 1, { states: 2, maxDuration, restarts: 3, seed: 7 });
+    const res = fitVbHsmm(X, T, 1, { states: 2, maxDuration, init: em.params, seed: 11, draws: 0 });
+    for (let k = 0; k < 2; k++) {
+      expect(res.meanParams.mu[k]).toBeCloseTo(em.params.mu[k], 1);
+    }
+    const a = expectedDurations(em.params), b = expectedDurations(res.meanParams);
+    for (let k = 0; k < 2; k++) expect(Math.abs(a[k] - b[k])).toBeLessThan(0.5);
+  });
+
+  test("rejects configurations the model cannot represent", () => {
+    expect(() => fitVbHsmm(X, T, 1, { states: 1, maxDuration })).toThrow(/at least 2 states/);
+    const em = fitHsmm(X, 500, 1, { states: 2, maxDuration: 8, restarts: 1, seed: 7 });
+    expect(() => fitVbHsmm(X, T, 1, { states: 2, maxDuration, init: em.params })).toThrow(/maxDuration/);
   });
 });

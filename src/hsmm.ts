@@ -71,12 +71,42 @@ const safeLog = (x: number) => (x > 0 ? Math.log(x) : NEG_INF);
  * Prefix sums of log emissions, so the log-likelihood of a whole segment is
  * one subtraction: segLogB(j, s, e) = P[(e+1)*K+j] - P[s*K+j].
  */
-function emissionPrefix(logB: Float64Array, T: number, K: number): Float64Array {
+export function emissionPrefix(logB: Float64Array, T: number, K: number): Float64Array {
   const P = new Float64Array((T + 1) * K);
   for (let t = 0; t < T; t++) {
     for (let j = 0; j < K; j++) P[(t + 1) * K + j] = P[t * K + j] + logB[t * K + j];
   }
   return P;
+}
+
+/**
+ * The chain, in the log-parameter space the recursions actually consume.
+ *
+ * Nothing below this line reads `HsmmParams`, and that is what lets maximum
+ * likelihood EM and variational EM share one set of recursions: the first
+ * passes the log of its current point estimates, the second passes E_q[log .]
+ * under the Dirichlet posteriors, and every recursion in between is identical.
+ */
+export interface HsmmChain {
+  K: number;
+  maxDuration: number;
+  /** log P(the first segment is state j). */
+  logPi: Float64Array;   // K
+  /** log A. The diagonal is -Infinity: dwell is the duration model's job. */
+  logA: Float64Array;    // K*K
+  /** log p_j(d). */
+  logDur: Float64Array;  // K*maxDuration
+}
+
+/** The chain implied by a point estimate. */
+export function chainOf(p: HsmmParams): HsmmChain {
+  const logPi = new Float64Array(p.K);
+  for (let j = 0; j < p.K; j++) logPi[j] = safeLog(p.pi[j]);
+  const logA = new Float64Array(p.K * p.K);
+  for (let i = 0; i < p.K * p.K; i++) logA[i] = safeLog(p.A[i]);
+  const logDur = new Float64Array(p.K * p.maxDuration);
+  for (let i = 0; i < logDur.length; i++) logDur[i] = safeLog(p.dur[i]);
+  return { K: p.K, maxDuration: p.maxDuration, logPi, logA, logDur };
 }
 
 interface ForwardHsmm {
@@ -87,13 +117,13 @@ interface ForwardHsmm {
   logLik: number;
 }
 
-function forwardHsmm(P: Float64Array, T: number, p: HsmmParams, logA: Float64Array, logDur: Float64Array): ForwardHsmm {
-  const { K, maxDuration } = p;
+function forwardHsmm(P: Float64Array, T: number, c: HsmmChain): ForwardHsmm {
+  const { K, maxDuration, logA, logDur } = c;
   const logAlpha = new Float64Array(T * K).fill(NEG_INF);
   const logEntry = new Float64Array(T * K).fill(NEG_INF);
   const acc = new LogAcc();
 
-  for (let j = 0; j < K; j++) logEntry[j] = safeLog(p.pi[j]);
+  for (let j = 0; j < K; j++) logEntry[j] = c.logPi[j];
 
   for (let t = 0; t < T; t++) {
     // A segment of state j ending at t could have started anywhere in
@@ -131,8 +161,8 @@ function forwardHsmm(P: Float64Array, T: number, p: HsmmParams, logA: Float64Arr
 }
 
 /** logBeta[t*K+i] = log P(o_{t+1}..o_{T-1} | a segment of state i ends at t). */
-function backwardHsmm(P: Float64Array, T: number, p: HsmmParams, logA: Float64Array, logDur: Float64Array): Float64Array {
-  const { K, maxDuration } = p;
+function backwardHsmm(P: Float64Array, T: number, c: HsmmChain): Float64Array {
+  const { K, maxDuration, logA, logDur } = c;
   const logBeta = new Float64Array(T * K).fill(NEG_INF);
   for (let i = 0; i < K; i++) logBeta[(T - 1) * K + i] = 0;
   const acc = new LogAcc();
@@ -201,31 +231,46 @@ export function fromHmm(h: HmmParams, maxDuration: number): HsmmParams {
   return { K, D, pi: Float64Array.from(h.pi), A, mu: Float64Array.from(h.mu), vari: Float64Array.from(h.vari), dur, maxDuration };
 }
 
-function logMatrices(p: HsmmParams) {
-  const logA = new Float64Array(p.K * p.K);
-  for (let i = 0; i < p.K * p.K; i++) logA[i] = safeLog(p.A[i]);
-  const logDur = new Float64Array(p.K * p.maxDuration);
-  for (let i = 0; i < logDur.length; i++) logDur[i] = safeLog(p.dur[i]);
-  return { logA, logDur };
+/** Expected sufficient statistics from one segmental forward-backward pass. */
+export interface HsmmExpectations {
+  /** T*K, P(state at t = j | the whole sequence). */
+  gamma: Float64Array;
+  /** K*K expected transition counts, diagonal zero. */
+  xi: Float64Array;
+  /** K*maxDuration expected duration counts. */
+  durCount: Float64Array;
+  /** K, expected count of "the first segment is state j". */
+  piCount: Float64Array;
+  /**
+   * log of the normalizer: the sequence log-likelihood when the chain carries
+   * real log parameters, and a sub-normalized mass — the first term of the
+   * ELBO — when it carries expected logs instead.
+   */
+  logZ: number;
 }
 
-/** One EM sweep. Returns the log-likelihood of the parameters on entry. */
-function emStepHsmm(X: Float64Array, T: number, p: HsmmParams, varFloor: number, durationPrior: number, transitionPrior: number): number {
-  const { K, D, maxDuration } = p;
-  const logB = logEmissions(X, T, { K, D, pi: p.pi, A: p.A, mu: p.mu, vari: p.vari });
-  const P = emissionPrefix(logB, T, K);
-  const { logA, logDur } = logMatrices(p);
+/**
+ * The E step. Both M steps are written against these four counts.
+ *
+ * Maximum likelihood normalizes them into probabilities; variational EM adds
+ * them to Dirichlet concentrations. Neither one needs to know how the segmental
+ * recursions got here, which is the whole reason this is a function.
+ */
+export function hsmmExpectations(P: Float64Array, T: number, c: HsmmChain): HsmmExpectations {
+  const { K, maxDuration, logA, logDur } = c;
+  const durCount = new Float64Array(K * maxDuration);
+  const piCount = new Float64Array(K);
+  const xi = new Float64Array(K * K);
+  const gamma = new Float64Array(T * K);
 
-  const { logAlpha, logEntry, logLik } = forwardHsmm(P, T, p, logA, logDur);
-  if (!Number.isFinite(logLik)) return logLik;
-  const logBeta = backwardHsmm(P, T, p, logA, logDur);
+  const { logAlpha, logEntry, logLik } = forwardHsmm(P, T, c);
+  if (!Number.isFinite(logLik)) return { gamma, xi, durCount, piCount, logZ: logLik };
+  const logBeta = backwardHsmm(P, T, c);
 
   // Occupancy is accumulated with a difference array: a segment contributes its
   // posterior to every bar it covers, and doing that by iterating the bars would
   // cost an extra factor of maxDuration.
   const diff = new Float64Array(K * (T + 1));
-  const durCount = new Float64Array(K * maxDuration);
-  const piCount = new Float64Array(K);
 
   for (let e = 0; e < T; e++) {
     for (let j = 0; j < K; j++) {
@@ -247,7 +292,6 @@ function emStepHsmm(X: Float64Array, T: number, p: HsmmParams, varFloor: number,
     }
   }
 
-  const gamma = new Float64Array(T * K);
   for (let j = 0; j < K; j++) {
     let run = 0;
     for (let t = 0; t < T; t++) {
@@ -257,7 +301,6 @@ function emStepHsmm(X: Float64Array, T: number, p: HsmmParams, varFloor: number,
   }
 
   // Expected transitions, counted only at segment boundaries.
-  const xi = new Float64Array(K * K);
   const inner = new LogAcc();
   for (let e = 0; e < T - 1; e++) {
     for (let i = 0; i < K; i++) {
@@ -278,6 +321,17 @@ function emStepHsmm(X: Float64Array, T: number, p: HsmmParams, varFloor: number,
       }
     }
   }
+
+  return { gamma, xi, durCount, piCount, logZ: logLik };
+}
+
+/** One EM sweep. Returns the log-likelihood of the parameters on entry. */
+function emStepHsmm(X: Float64Array, T: number, p: HsmmParams, varFloor: number, durationPrior: number, transitionPrior: number): number {
+  const { K, D, maxDuration } = p;
+  const logB = logEmissions(X, T, { K, D, pi: p.pi, A: p.A, mu: p.mu, vari: p.vari });
+  const P = emissionPrefix(logB, T, K);
+  const { gamma, xi, durCount, piCount, logZ: logLik } = hsmmExpectations(P, T, chainOf(p));
+  if (!Number.isFinite(logLik)) return logLik;
 
   // --- M step ---
   let piTotal = 0;
@@ -368,8 +422,7 @@ export function fitHsmm(X: Float64Array, T: number, D: number, options: HsmmFitO
 }
 
 /** Relabel states by ascending mean of feature 0, matching the HMM convention. */
-export function sortHsmmStates(res: HsmmFitResult): HsmmFitResult {
-  const p = res.params;
+export function relabelHsmm(p: HsmmParams): HsmmParams {
   const { K, D, maxDuration } = p;
   const order = Array.from({ length: K }, (_, k) => k).sort((a, b) => p.mu[a * D] - p.mu[b * D]);
 
@@ -388,7 +441,11 @@ export function sortHsmmStates(res: HsmmFitResult): HsmmFitResult {
     for (let d = 0; d < maxDuration; d++) dur[ni * maxDuration + d] = p.dur[oi * maxDuration + d];
     for (let nj = 0; nj < K; nj++) A[ni * K + nj] = p.A[oi * K + order[nj]];
   }
-  return { ...res, params: { K, D, pi, A, mu, vari, dur, maxDuration } };
+  return { K, D, pi, A, mu, vari, dur, maxDuration };
+}
+
+export function sortHsmmStates(res: HsmmFitResult): HsmmFitResult {
+  return { ...res, params: relabelHsmm(res.params) };
 }
 
 /** Mean dwell time implied by each state's learned duration pmf. */
@@ -436,8 +493,7 @@ export function filterHsmm(X: Float64Array, T: number, p: HsmmParams): HsmmFilte
   const { K, D, maxDuration } = p;
   const logB = logEmissions(X, T, { K, D, pi: p.pi, A: p.A, mu: p.mu, vari: p.vari });
   const P = emissionPrefix(logB, T, K);
-  const { logA, logDur } = logMatrices(p);
-  const { logAlpha, logEntry, logLik } = forwardHsmm(P, T, p, logA, logDur);
+  const { logAlpha, logEntry, logLik } = forwardHsmm(P, T, chainOf(p));
   const S = survival(p);
   const sIdx = (j: number, k: number) => j * (maxDuration + 2) + k;
 
@@ -520,7 +576,7 @@ export function viterbiHsmm(X: Float64Array, T: number, p: HsmmParams): Int32Arr
   const { K, D, maxDuration } = p;
   const logB = logEmissions(X, T, { K, D, pi: p.pi, A: p.A, mu: p.mu, vari: p.vari });
   const P = emissionPrefix(logB, T, K);
-  const { logA, logDur } = logMatrices(p);
+  const { logPi, logA, logDur } = chainOf(p);
 
   const delta = new Float64Array(T * K).fill(NEG_INF);
   const backState = new Int32Array(T * K).fill(-1);
@@ -536,7 +592,7 @@ export function viterbiHsmm(X: Float64Array, T: number, p: HsmmParams): Int32Arr
         const dl = logDur[j * maxDuration + (d - 1)];
         if (dl === NEG_INF) continue;
         if (s === 0) {
-          const v = safeLog(p.pi[j]) + dl + seg;
+          const v = logPi[j] + dl + seg;
           if (v > best) { best = v; bi = -1; bd = d; }
         } else {
           for (let i = 0; i < K; i++) {

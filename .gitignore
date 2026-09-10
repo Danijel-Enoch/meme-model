@@ -25,3 +25,6 @@ build/
 # os / editor
 .DS_Store
 *.log
+
+# sweep output: fitted models and the ranked table
+models/

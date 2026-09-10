@@ -49,6 +49,10 @@
 
 import { backward, forward, logEmissions, makeRng, randn, type HmmParams } from "./hmm";
 import {
+  chainOf, emissionPrefix, expectedDurations, fromHmm, hsmmExpectations, relabelHsmm,
+  type HsmmChain, type HsmmExpectations, type HsmmParams,
+} from "./hsmm";
+import {
   DEFAULT_PRIORS, relabel, sampleDirichlet, sampleGamma, type Priors,
 } from "./posterior";
 
@@ -96,22 +100,24 @@ export function digamma(x: number): number {
 // ---------------------------------------------------------------------------
 
 /**
- * The variational posterior q(theta), stored as its hyperparameters.
+ * The emission half of q(theta), which both models share:
  *
- *   q(pi)          = Dirichlet(alphaPi)
- *   q(A[i])        = Dirichlet(alphaA[i])
- *   q(mu_kd, lam)  = NormalGamma(m, kappa, a, b)
- *                    lam ~ Gamma(a, rate b), mu | lam ~ N(m, 1/(kappa lam))
+ *   q(mu_kd, lam) = NormalGamma(m, kappa, a, b)
+ *                   lam ~ Gamma(a, rate b), mu | lam ~ N(m, 1/(kappa lam))
  */
-export interface VbPosterior {
+export interface EmissionPosterior {
   K: number;
   D: number;
-  alphaPi: Float64Array;  // K
-  alphaA: Float64Array;   // K*K
   m: Float64Array;        // K*D
   kappa: Float64Array;    // K*D
   a: Float64Array;        // K*D
   b: Float64Array;        // K*D
+}
+
+/** The Markov chain half: q(pi) = Dirichlet(alphaPi), q(A[i]) = Dirichlet(alphaA[i]). */
+export interface VbPosterior extends EmissionPosterior {
+  alphaPi: Float64Array;  // K
+  alphaA: Float64Array;   // K*K
 }
 
 export interface VbOptions {
@@ -231,12 +237,26 @@ function mStep(
     }
   }
 
+  return { ...emissionPosterior(X, T, D, K, e.gamma, pri), alphaPi, alphaA };
+}
+
+/**
+ * The Normal-Gamma half of the M step, driven by responsibilities.
+ *
+ * Written against gamma alone, so the semi-Markov M step reuses it verbatim:
+ * whether those responsibilities came from a Markov forward-backward or a
+ * segmental one makes no difference to the conjugate update.
+ */
+function emissionPosterior(
+  X: Float64Array, T: number, D: number, K: number,
+  gamma: Float64Array, pri: Priors,
+): EmissionPosterior {
   const N = new Float64Array(K);
   const sum = new Float64Array(K * D);
   const sumSq = new Float64Array(K * D);
   for (let t = 0; t < T; t++) {
     for (let k = 0; k < K; k++) {
-      const w = e.gamma[t * K + k];
+      const w = gamma[t * K + k];
       if (w <= 0) continue;
       N[k] += w;
       for (let d = 0; d < D; d++) {
@@ -268,15 +288,24 @@ function mStep(
       b[k * D + d] = pri.b0 + 0.5 * scatter + (pri.kappa0 * n * (xbar - pri.mu0) ** 2) / (2 * kap);
     }
   }
-  return { K, D, alphaPi, alphaA, m, kappa, a, b };
+  return { K, D, m, kappa, a, b };
 }
 
-/** exp(E_q[log p]) for a Dirichlet row: exp(psi(alpha_i) - psi(sum alpha)). */
-function expectedLogSimplex(alphas: Float64Array, offset: number, K: number, out: Float64Array) {
+/** E_q[log p_i] for a Dirichlet row: psi(alpha_i) - psi(sum alpha). */
+function expectedLogDirichlet(
+  alphas: Float64Array, offset: number, n: number,
+  out: Float64Array, outOffset = 0,
+) {
   let total = 0;
-  for (let k = 0; k < K; k++) total += alphas[offset + k];
+  for (let k = 0; k < n; k++) total += alphas[offset + k];
   const psiTotal = digamma(total);
-  for (let k = 0; k < K; k++) out[k] = Math.exp(digamma(alphas[offset + k]) - psiTotal);
+  for (let k = 0; k < n; k++) out[outOffset + k] = digamma(alphas[offset + k]) - psiTotal;
+}
+
+/** The same thing exponentiated, for the Markov recursions that want it linear. */
+function expectedLogSimplex(alphas: Float64Array, offset: number, K: number, out: Float64Array) {
+  expectedLogDirichlet(alphas, offset, K, out);
+  for (let k = 0; k < K; k++) out[k] = Math.exp(out[k]);
 }
 
 /**
@@ -288,7 +317,7 @@ function expectedLogSimplex(alphas: Float64Array, offset: number, K: number, out
  * knowing mu, and it is what stops a state with three observations from
  * claiming a razor-sharp emission.
  */
-function expectedLogEmissions(X: Float64Array, T: number, q: VbPosterior): Float64Array {
+function expectedLogEmissions(X: Float64Array, T: number, q: EmissionPosterior): Float64Array {
   const { K, D, m, kappa, a, b } = q;
   const logB = new Float64Array(T * K);
   // Everything not involving x, precomputed per (k, d).
@@ -366,14 +395,18 @@ function elboOf(logZ: number, q: VbPosterior, pri: Priors): number {
     kl += klDirichlet(q.alphaA, i * K, priorRow, 0, K);
   }
 
-  for (let k = 0; k < K; k++) {
-    for (let d = 0; d < D; d++) {
-      const i = k * D + d;
-      kl += klNormalGamma(q.m[i], q.kappa[i], q.a[i], q.b[i],
-        pri.mu0, pri.kappa0, pri.a0, pri.b0);
-    }
-  }
+  kl += klEmissions(q, pri);
   return logZ - kl;
+}
+
+/** sum_{k,d} KL( q(mu, lambda) || prior ). */
+function klEmissions(q: EmissionPosterior, pri: Priors): number {
+  let kl = 0;
+  for (let i = 0; i < q.K * q.D; i++) {
+    kl += klNormalGamma(q.m[i], q.kappa[i], q.a[i], q.b[i],
+      pri.mu0, pri.kappa0, pri.a0, pri.b0);
+  }
+  return kl;
 }
 
 /** Start q at the prior. */
@@ -440,19 +473,33 @@ export function drawFromQ(q: VbPosterior, rng: () => number): HmmParams {
     const row = sampleDirichlet(Array.from(q.alphaA.slice(i * K, i * K + K)), rng);
     for (let j = 0; j < K; j++) A[i * K + j] = row[j];
   }
+  const { mu, vari } = drawEmissions(q, rng);
+  return { K, D, pi, A, mu, vari };
+}
+
+/** One draw of (mu, var) from the Normal-Gamma block. Shared by both engines. */
+function drawEmissions(q: EmissionPosterior, rng: () => number) {
+  const { K, D } = q;
   const mu = new Float64Array(K * D);
   const vari = new Float64Array(K * D);
-  for (let k = 0; k < K; k++) {
-    for (let d = 0; d < D; d++) {
-      const i = k * D + d;
-      // lambda ~ Gamma(a, rate b); Gamma(a,1)/b is the same thing.
-      const lambda = Math.max(sampleGamma(q.a[i], rng) / q.b[i], 1e-300);
-      const v = 1 / lambda;
-      vari[i] = Math.max(v, 1e-10);
-      mu[i] = q.m[i] + Math.sqrt(v / q.kappa[i]) * randn(rng);
-    }
+  for (let i = 0; i < K * D; i++) {
+    // lambda ~ Gamma(a, rate b); Gamma(a,1)/b is the same thing.
+    const lambda = Math.max(sampleGamma(q.a[i], rng) / q.b[i], 1e-300);
+    const v = 1 / lambda;
+    vari[i] = Math.max(v, 1e-10);
+    mu[i] = q.m[i] + Math.sqrt(v / q.kappa[i]) * randn(rng);
   }
-  return { K, D, pi, A, mu, vari };
+  return { mu, vari };
+}
+
+/** Posterior mean of (mu, var). E[var] = b/(a-1) exists only for a > 1. */
+function meanEmissions(q: EmissionPosterior) {
+  const mu = Float64Array.from(q.m);
+  const vari = new Float64Array(q.K * q.D);
+  for (let i = 0; i < q.K * q.D; i++) {
+    vari[i] = q.a[i] > 1 ? q.b[i] / (q.a[i] - 1) : q.b[i] / Math.max(q.a[i], 1e-6);
+  }
+  return { mu, vari };
 }
 
 /** Posterior mean parameters. E[var] = b/(a-1) exists only for a > 1. */
@@ -470,12 +517,7 @@ export function vbMeanParams(q: VbPosterior): HmmParams {
     for (let j = 0; j < K; j++) A[i * K + j] = q.alphaA[i * K + j] / rowTotal;
   }
 
-  const mu = Float64Array.from(q.m);
-  const vari = new Float64Array(K * D);
-  for (let i = 0; i < K * D; i++) {
-    vari[i] = q.a[i] > 1 ? q.b[i] / (q.a[i] - 1) : q.b[i] / Math.max(q.a[i], 1e-6);
-  }
-  return { K, D, pi, A, mu, vari };
+  return { K, D, pi, A, ...meanEmissions(q) };
 }
 
 /**
@@ -557,8 +599,8 @@ export function fitVb(X: Float64Array, T: number, D: number, options: VbOptions 
   };
 }
 
-export interface StateSelection {
-  best: VbResult;
+export interface StateSelection<R = VbResult> {
+  best: R;
   /** One row per candidate K, in the order tried. */
   scores: { states: number; elbo: number; elboPerBar: number; occupied: number }[];
 }
@@ -610,4 +652,352 @@ export function vbPosteriors(X: Float64Array, T: number, q: VbPosterior): Float6
     for (let j = 0; j < K; j++) AT[i * K + j] = row[j];
   }
   return eStep(expectedLogEmissions(X, T, q), T, K, piT, AT).gamma;
+}
+
+// ---------------------------------------------------------------------------
+// The semi-Markov engine.
+//
+// Same alternation, same conjugate priors, same bound. What changes is the
+// chain. Dwell stops being the diagonal of A and becomes a distribution of its
+// own, so
+//
+//   q(A[i])    is a Dirichlet over the K-1 states that are NOT i
+//   q(p_j(.))  is a Dirichlet over d = 1..maxDuration, and it is inferred
+//
+// and the E step runs hsmm.ts's segmental forward-backward rather than the
+// Markov one. Everything else is shared with the code above: the emission
+// update, the KL bookkeeping, the draws, and the summary layer in posterior.ts
+// that turns draws into credible intervals.
+//
+// The one thing to keep in mind when reading the output: this is still mean
+// field, so the intervals are still biased narrow, and there is no `--gibbs`
+// counterpart for the semi-Markov model to check them against.
+// ---------------------------------------------------------------------------
+
+export interface VbHsmmPosterior extends EmissionPosterior {
+  maxDuration: number;
+  alphaPi: Float64Array;   // K
+  /** K*K. The diagonal is held at zero and never read — no self-transitions. */
+  alphaA: Float64Array;
+  alphaDur: Float64Array;  // K*maxDuration
+}
+
+export interface VbHsmmOptions extends Omit<VbOptions, "init"> {
+  /** Longest dwell the duration pmf can represent. */
+  maxDuration?: number;
+  /** Warm start. An `fitHsmm` result is the obvious choice. */
+  init?: HsmmParams;
+}
+
+export interface VbHsmmResult {
+  K: number;
+  D: number;
+  maxDuration: number;
+  q: VbHsmmPosterior;
+  /** Final ELBO, in nats. Comparable across K at a fixed maxDuration. */
+  elbo: number;
+  elboTrace: number[];
+  iterations: number;
+  converged: boolean;
+  /**
+   * i.i.d. draws from q. These are HsmmParams, which carry every field an
+   * HmmParams has, so a VbHsmmResult is a PosteriorDraws and the summary
+   * functions take it unchanged.
+   */
+  samples: HsmmParams[];
+  /** Each draw's expected dwell per state, from that draw's own duration pmf. */
+  dwell: number[][];
+  /** Posterior mean parameters, for filtering and one-step-ahead prediction. */
+  meanParams: HsmmParams;
+  gamma: Float64Array;
+  occupancy: Float64Array;
+}
+
+/**
+ * E_q[log .] for the whole chain — the semi-Markov analogue of the two
+ * `expectedLogSimplex` calls the Markov E step makes, in logs because the
+ * segmental recursions work there.
+ */
+function hsmmChainOf(q: VbHsmmPosterior): HsmmChain {
+  const { K, maxDuration } = q;
+  const logPi = new Float64Array(K);
+  expectedLogDirichlet(q.alphaPi, 0, K, logPi);
+
+  // Each row of A is a simplex over the K-1 states that are not i, so the
+  // digamma normalizer runs over those alone and the diagonal stays -Infinity.
+  const logA = new Float64Array(K * K).fill(-Infinity);
+  for (let i = 0; i < K; i++) {
+    let total = 0;
+    for (let j = 0; j < K; j++) if (j !== i) total += q.alphaA[i * K + j];
+    const psiTotal = digamma(total);
+    for (let j = 0; j < K; j++) {
+      if (j !== i) logA[i * K + j] = digamma(q.alphaA[i * K + j]) - psiTotal;
+    }
+  }
+
+  const logDur = new Float64Array(K * maxDuration);
+  for (let j = 0; j < K; j++) {
+    expectedLogDirichlet(q.alphaDur, j * maxDuration, maxDuration, logDur, j * maxDuration);
+  }
+  return { K, maxDuration, logPi, logA, logDur };
+}
+
+/**
+ * M step. Identical in spirit to the Markov one: prior concentration plus
+ * expected counts, and the same Normal-Gamma update on the emissions.
+ *
+ * Note what is missing — `alphaSelf`. Under a Markov model a prior on the
+ * diagonal is the only way to say "regimes persist"; here persistence is the
+ * duration distribution, and asserting it in the transition prior as well would
+ * be counting the same belief twice.
+ */
+function mStepHsmm(
+  X: Float64Array, T: number, D: number, K: number, maxDuration: number,
+  e: HsmmExpectations, pri: Priors,
+): VbHsmmPosterior {
+  const alphaPi = new Float64Array(K);
+  for (let k = 0; k < K; k++) alphaPi[k] = pri.alpha + e.piCount[k];
+
+  const alphaA = new Float64Array(K * K);
+  for (let i = 0; i < K; i++) {
+    for (let j = 0; j < K; j++) if (i !== j) alphaA[i * K + j] = pri.alpha + e.xi[i * K + j];
+  }
+
+  const alphaDur = new Float64Array(K * maxDuration);
+  for (let i = 0; i < K * maxDuration; i++) alphaDur[i] = pri.alphaDur + e.durCount[i];
+
+  return {
+    ...emissionPosterior(X, T, D, K, e.gamma, pri),
+    maxDuration, alphaPi, alphaA, alphaDur,
+  };
+}
+
+/** sum_i KL over row i's off-diagonal simplex. */
+function klOffDiagonal(alphaA: Float64Array, K: number, priorAlpha: number): number {
+  const row = new Float64Array(K - 1);
+  const prior = new Float64Array(K - 1).fill(priorAlpha);
+  let kl = 0;
+  for (let i = 0; i < K; i++) {
+    let n = 0;
+    for (let j = 0; j < K; j++) if (j !== i) row[n++] = alphaA[i * K + j];
+    kl += klDirichlet(row, 0, prior, 0, K - 1);
+  }
+  return kl;
+}
+
+/** ELBO = log Z~ - KL(q(theta) || p(theta)), with the durations now in it. */
+function elboHsmm(logZ: number, q: VbHsmmPosterior, pri: Priors): number {
+  const { K, maxDuration } = q;
+  const priorPi = new Float64Array(K).fill(pri.alpha);
+  let kl = klDirichlet(q.alphaPi, 0, priorPi, 0, K);
+  kl += klOffDiagonal(q.alphaA, K, pri.alpha);
+
+  const priorDur = new Float64Array(maxDuration).fill(pri.alphaDur);
+  for (let j = 0; j < K; j++) {
+    kl += klDirichlet(q.alphaDur, j * maxDuration, priorDur, 0, maxDuration);
+  }
+  kl += klEmissions(q, pri);
+  return logZ - kl;
+}
+
+/** Permutation of q's states into ascending order of m[.][0]. */
+function sortHsmmPosterior(q: VbHsmmPosterior): VbHsmmPosterior {
+  const { K, D, maxDuration } = q;
+  const order = Array.from({ length: K }, (_, k) => k).sort((x, y) => q.m[x * D] - q.m[y * D]);
+  const out: VbHsmmPosterior = {
+    K, D, maxDuration,
+    alphaPi: new Float64Array(K),
+    alphaA: new Float64Array(K * K),
+    alphaDur: new Float64Array(K * maxDuration),
+    m: new Float64Array(K * D),
+    kappa: new Float64Array(K * D),
+    a: new Float64Array(K * D),
+    b: new Float64Array(K * D),
+  };
+  for (let ni = 0; ni < K; ni++) {
+    const oi = order[ni];
+    out.alphaPi[ni] = q.alphaPi[oi];
+    for (let nj = 0; nj < K; nj++) out.alphaA[ni * K + nj] = q.alphaA[oi * K + order[nj]];
+    for (let d = 0; d < maxDuration; d++) {
+      out.alphaDur[ni * maxDuration + d] = q.alphaDur[oi * maxDuration + d];
+    }
+    for (let d = 0; d < D; d++) {
+      out.m[ni * D + d] = q.m[oi * D + d];
+      out.kappa[ni * D + d] = q.kappa[oi * D + d];
+      out.a[ni * D + d] = q.a[oi * D + d];
+      out.b[ni * D + d] = q.b[oi * D + d];
+    }
+  }
+  return out;
+}
+
+/** One independent draw from q. */
+export function drawFromQHsmm(q: VbHsmmPosterior, rng: () => number): HsmmParams {
+  const { K, D, maxDuration } = q;
+  const pi = Float64Array.from(sampleDirichlet(Array.from(q.alphaPi), rng));
+
+  const A = new Float64Array(K * K);
+  const targets: number[] = [];
+  for (let i = 0; i < K; i++) {
+    targets.length = 0;
+    const conc: number[] = [];
+    for (let j = 0; j < K; j++) if (j !== i) { targets.push(j); conc.push(q.alphaA[i * K + j]); }
+    const row = sampleDirichlet(conc, rng);
+    for (let n = 0; n < targets.length; n++) A[i * K + targets[n]] = row[n];
+  }
+
+  const dur = new Float64Array(K * maxDuration);
+  for (let j = 0; j < K; j++) {
+    const row = sampleDirichlet(
+      Array.from(q.alphaDur.subarray(j * maxDuration, (j + 1) * maxDuration)), rng);
+    for (let d = 0; d < maxDuration; d++) dur[j * maxDuration + d] = row[d];
+  }
+
+  return { K, D, maxDuration, pi, A, dur, ...drawEmissions(q, rng) };
+}
+
+/** Posterior mean parameters. */
+export function vbHsmmMeanParams(q: VbHsmmPosterior): HsmmParams {
+  const { K, D, maxDuration } = q;
+  const pi = new Float64Array(K);
+  let piTotal = 0;
+  for (let k = 0; k < K; k++) piTotal += q.alphaPi[k];
+  for (let k = 0; k < K; k++) pi[k] = q.alphaPi[k] / piTotal;
+
+  const A = new Float64Array(K * K);
+  for (let i = 0; i < K; i++) {
+    let rowTotal = 0;
+    for (let j = 0; j < K; j++) if (j !== i) rowTotal += q.alphaA[i * K + j];
+    for (let j = 0; j < K; j++) if (j !== i) A[i * K + j] = q.alphaA[i * K + j] / rowTotal;
+  }
+
+  const dur = new Float64Array(K * maxDuration);
+  for (let j = 0; j < K; j++) {
+    let total = 0;
+    for (let d = 0; d < maxDuration; d++) total += q.alphaDur[j * maxDuration + d];
+    for (let d = 0; d < maxDuration; d++) {
+      dur[j * maxDuration + d] = q.alphaDur[j * maxDuration + d] / total;
+    }
+  }
+  return { K, D, maxDuration, pi, A, dur, ...meanEmissions(q) };
+}
+
+/**
+ * Fit the variational posterior over an explicit-duration model.
+ *
+ * The bound is monotone here for the same reason it is in `fitVb`: each E step
+ * is evaluated against the q(theta) it was computed from, and the M step that
+ * follows can only raise it.
+ */
+export function fitVbHsmm(X: Float64Array, T: number, D: number, options: VbHsmmOptions = {}): VbHsmmResult {
+  const K = options.states ?? 3;
+  const maxDuration = options.maxDuration ?? options.init?.maxDuration ?? 60;
+  const maxIter = options.maxIter ?? 300;
+  const tol = options.tol ?? 1e-7;
+  const drawCount = options.draws ?? 4000;
+  const pri: Priors = { ...DEFAULT_PRIORS, ...(options.priors ?? {}) };
+  const rng = makeRng(options.seed ?? 20240);
+
+  if (K < 2) throw new Error("a semi-Markov model needs at least 2 states: with one there is nothing to transition to");
+  if (T < K * 10) throw new Error(`need at least ${K * 10} observations for ${K} states, got ${T}`);
+  if (options.init && options.init.maxDuration !== maxDuration) {
+    throw new Error(`init was fitted with maxDuration ${options.init.maxDuration}, not ${maxDuration}`);
+  }
+  if (options.init && options.init.K !== K) {
+    throw new Error(`init has ${options.init.K} states, not ${K}`);
+  }
+
+  // Seed the first M step from the initial parameters' own responsibilities,
+  // exactly as if they had come out of an E step.
+  const seed = options.init ?? fromHmm(diffuseInit(K, D), maxDuration);
+  let e = hsmmExpectations(emissionPrefix(logEmissions(X, T, seed), T, K), T, chainOf(seed));
+  let q = mStepHsmm(X, T, D, K, maxDuration, e, pri);
+
+  const elboTrace: number[] = [];
+  let prev = -Infinity;
+  let iter = 0;
+  let converged = false;
+
+  for (; iter < maxIter; iter++) {
+    // --- E step: segmental forward-backward on expected log parameters ---
+    const logB = expectedLogEmissions(X, T, q);
+    const next = hsmmExpectations(emissionPrefix(logB, T, K), T, hsmmChainOf(q));
+    if (!Number.isFinite(next.logZ)) break;
+    e = next;
+
+    const elbo = elboHsmm(e.logZ, q, pri);
+    elboTrace.push(elbo);
+
+    // --- M step ---
+    q = mStepHsmm(X, T, D, K, maxDuration, e, pri);
+
+    if (Math.abs(elbo - prev) / T < tol) { converged = true; iter++; break; }
+    prev = elbo;
+  }
+
+  const order = Array.from({ length: K }, (_, k) => k).sort((x, y) => q.m[x * D] - q.m[y * D]);
+  const sorted = sortHsmmPosterior(q);
+  const gamma = permute(e.gamma, T, K, order);
+
+  const occupancy = new Float64Array(K);
+  for (let t = 0; t < T; t++) for (let k = 0; k < K; k++) occupancy[k] += gamma[t * K + k];
+
+  const samples: HsmmParams[] = [];
+  const dwell: number[][] = [];
+  for (let i = 0; i < drawCount; i++) {
+    const draw = relabelHsmm(drawFromQHsmm(sorted, rng));
+    samples.push(draw);
+    dwell.push(expectedDurations(draw));
+  }
+
+  return {
+    K, D, maxDuration,
+    q: sorted,
+    elbo: elboTrace.length ? elboTrace[elboTrace.length - 1] : -Infinity,
+    elboTrace,
+    iterations: iter,
+    converged,
+    samples,
+    dwell,
+    meanParams: vbHsmmMeanParams(sorted),
+    gamma,
+    occupancy,
+  };
+}
+
+/**
+ * Pick the number of regimes by ELBO, semi-Markov version.
+ *
+ * Same argument as `selectStates`, one caveat: keep `maxDuration` fixed across
+ * the candidates. It changes the size of the duration simplex and therefore the
+ * KL, so bounds computed at different maxDuration are not comparable.
+ */
+export function selectStatesHsmm(
+  X: Float64Array, T: number, D: number,
+  candidates: number[] = [2, 3, 4],
+  options: Omit<VbHsmmOptions, "states" | "init"> & { init?: (k: number) => HsmmParams } = {},
+): StateSelection<VbHsmmResult> {
+  const { init, ...rest } = options;
+  let best: VbHsmmResult | null = null;
+  const scores: StateSelection["scores"] = [];
+
+  for (const k of candidates) {
+    if (k < 2 || T < k * 10) continue;
+    const res = fitVbHsmm(X, T, D, { ...rest, states: k, init: init?.(k) });
+    const occupied = Array.from(res.occupancy).filter((n) => n > 0.01 * T).length;
+    scores.push({ states: k, elbo: res.elbo, elboPerBar: res.elbo / T, occupied });
+    if (!best || res.elbo > best.elbo) best = res;
+  }
+  if (!best) throw new Error(`no candidate K fits in ${T} observations`);
+  return { best, scores };
+}
+
+/**
+ * Smoothed state posterior from an already-fitted q, for new data. The
+ * semi-Markov counterpart of `vbPosteriors`; for the causal, one-step-ahead
+ * quantity a trader needs, run `filterHsmm` on `meanParams` instead.
+ */
+export function vbHsmmPosteriors(X: Float64Array, T: number, q: VbHsmmPosterior): Float64Array {
+  const P = emissionPrefix(expectedLogEmissions(X, T, q), T, q.K);
+  return hsmmExpectations(P, T, hsmmChainOf(q)).gamma;
 }

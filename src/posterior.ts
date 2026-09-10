@@ -29,10 +29,26 @@ export interface Priors {
   alpha: number;
   /** Extra concentration on the diagonal, encoding "regimes persist". */
   alphaSelf: number;
+  /**
+   * Dirichlet concentration per duration bin, read only by the semi-Markov
+   * engine. It is the same 0.05 the maximum-likelihood HSMM adds to its
+   * duration counts, and it works the same way in one direction and harder in
+   * the other: a bin with real support is barely moved, while a bin the data
+   * never fills gets suppressed rather than merely smoothed, because the E step
+   * consumes E[log p_j(d)] and digamma punishes small concentrations. That is
+   * the intended behaviour — "this regime never lasts forty bars" is a claim
+   * the duration model should be allowed to make — but it is the knob to raise
+   * if a learned pmf comes out spikier than the sample supports.
+   *
+   * There is deliberately no `alphaSelf` analogue here. Under a semi-Markov
+   * model persistence is not a prior on the diagonal, it is the duration
+   * distribution, and that is learned.
+   */
+  alphaDur: number;
 }
 
 export const DEFAULT_PRIORS: Priors = {
-  mu0: 0, kappa0: 0.5, a0: 2, b0: 1, alpha: 1, alphaSelf: 8,
+  mu0: 0, kappa0: 0.5, a0: 2, b0: 1, alpha: 1, alphaSelf: 8, alphaDur: 0.05,
 };
 
 /** Gamma(shape, 1) by Marsaglia-Tsang. Exported for testing. */
@@ -77,6 +93,16 @@ export interface PosteriorDraws {
   K: number;
   D: number;
   samples: HmmParams[];
+  /**
+   * Per-draw expected dwell time, one row of K per sample.
+   *
+   * A Markov engine leaves this out and the summaries below fall back to the
+   * geometric 1 / (1 - A_kk) implied by its transition matrix. A semi-Markov
+   * engine fills it from each draw's own duration pmf — which it must, since
+   * its A has a zero diagonal and the geometric reading of it would say every
+   * regime lasts exactly one bar.
+   */
+  dwell?: number[][];
 }
 
 export interface Interval {
@@ -115,13 +141,19 @@ export function posteriorStateMeans(
     summarize(res.samples.map((s) => unscale(s.mu[k * res.D + d])), credible));
 }
 
-/** Posterior for each state's expected dwell time, 1 / (1 - A[k][k]). */
+/**
+ * Posterior for each state's expected dwell time: 1 / (1 - A[k][k]) under a
+ * Markov model, or the mean of the drawn duration pmf under a semi-Markov one.
+ */
 export function posteriorDurations(res: PosteriorDraws, credible = 0.9): Interval[] {
   return Array.from({ length: res.K }, (_, k) =>
-    summarize(res.samples.map((s) => {
-      const stay = Math.min(s.A[k * res.K + k], 1 - 1e-9);
-      return 1 / (1 - stay);
-    }), credible));
+    summarize(res.samples.map((s, i) => dwellOf(res, s, i, k)), credible));
+}
+
+function dwellOf(res: PosteriorDraws, s: HmmParams, i: number, k: number): number {
+  if (res.dwell) return res.dwell[i][k];
+  const stay = Math.min(s.A[k * res.K + k], 1 - 1e-9);
+  return 1 / (1 - stay);
 }
 
 /**
@@ -137,10 +169,11 @@ export function posteriorDurations(res: PosteriorDraws, credible = 0.9): Interva
  * `--duration-aware` existed. A position held for its regime's dwell time
  * accumulates `edge * holdBars`, and that is what has to clear the cost.
  *
- * The hold is drawn from the posterior too: each draw has its own transition
- * matrix, hence its own expected dwell 1 / (1 - A[k][k]) for the state being
- * traded. So both the size of the edge and how long it persists are integrated
- * over, rather than fixed at a point estimate.
+ * The hold is drawn from the posterior too: each draw carries its own dwell for
+ * the state being traded — geometric from its transition matrix, or the mean of
+ * its own duration pmf when the draws came from a semi-Markov fit. So both the
+ * size of the edge and how long it persists are integrated over, rather than
+ * fixed at a point estimate.
  */
 export function posteriorSignal(
   res: PosteriorDraws,
@@ -156,13 +189,12 @@ export function posteriorSignal(
   const tradeDraws: number[] = [];
   const holds: number[] = [];
 
-  for (const s of res.samples) {
+  for (const [i, s] of res.samples.entries()) {
     let e = 0;
     for (let k = 0; k < res.K; k++) e += stateProbs[k] * unscale(s.mu[k * res.D]);
     perBarDraws.push(e);
 
-    const stay = Math.min(s.A[traded * res.K + traded], 1 - 1e-9);
-    const hold = opts.holdBars ?? 1 / (1 - stay);
+    const hold = opts.holdBars ?? dwellOf(res, s, i, traded);
     holds.push(hold);
     tradeDraws.push(e * hold);
   }

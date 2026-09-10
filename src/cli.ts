@@ -13,11 +13,12 @@ import {
 import { walkForward, stateMeanReturns, extractTrades, summarizeTrades, type StrategyConfig, type WalkForwardConfig, type ModelType, type Trade } from "./backtest";
 import { fitHsmm, filterHsmm, viterbiHsmm, expectedDurations, serializeHsmm, deserializeHsmm, type HsmmParams } from "./hsmm";
 import { permutationTest, ceilingAnalysis, tradedSeries } from "./diagnostics";
+import { sweep, saveBestModel, rejectionReason, DEFAULT_TIMEFRAMES, type SweepConfig } from "./sweep";
 import { walkForwardConfluence, DEFAULT_STACK, type TimeframeSpec } from "./confluence";
 import * as hl from "./hyperliquid";
 import { simulatePerp } from "./perp";
 import { runMcmc } from "./mcmc";
-import { fitVb, selectStates } from "./vb";
+import { fitVb, fitVbHsmm, selectStates, selectStatesHsmm } from "./vb";
 import {
   posteriorStateMeans, posteriorDurations, posteriorSignal, DEFAULT_PRIORS,
   type PosteriorDraws,
@@ -218,8 +219,12 @@ interface DataSet {
   label: string;
   /** Derived from the actual bar spacing, so Sharpe annualizes correctly. */
   barsPerYear: number;
-  /** Present when the data came from an API — recorded into saved models. */
-  source?: { network: string; pool: string; timeframe: string };
+  /**
+   * Present when the data came from an API — recorded into saved models so
+   * `predict` can reload it. A DEX pool is identified by network + pool, a perp
+   * by coin; both carry the timeframe they were sampled at.
+   */
+  source?: { network?: string; pool?: string; coin?: string; timeframe: string };
 }
 
 /**
@@ -338,6 +343,7 @@ async function hyperliquidDataSet(f: Flags): Promise<DataSet> {
     candles: res.candles,
     label: `${coin}-PERP ${interval}`,
     barsPerYear: hl.hlBarsPerYear(interval),
+    source: { coin, timeframe: interval },
   };
 }
 
@@ -484,13 +490,23 @@ async function cmdPredict(f: Flags) {
     : deserialize(JSON.stringify(saved.params));
   const scaler: Scaler = { mean: new Float64Array(saved.scaler.mean), std: new Float64Array(saved.scaler.std) };
 
-  // Reuse the pool the model was trained on unless the caller names another.
+  // Reuse the market the model was trained on unless the caller names another.
+  // Without this the model would silently fall through to synthetic data and
+  // print a confident signal computed on numbers that are not the market.
   const flags: Flags = { ...f };
-  if (!flags["csv"] && !flags["pool"] && !flags["token"] && saved.source) {
-    flags["pool"] = saved.source.pool;
-    flags["network"] = saved.source.network;
+  const named = flags["csv"] || flags["pool"] || flags["token"] || flags["coin"];
+  if (!named && saved.source) {
+    if (saved.source.coin) {
+      flags["coin"] = saved.source.coin;
+      console.log(`using the model's source: ${saved.label ?? saved.source.coin} on Hyperliquid`);
+    } else {
+      flags["pool"] = saved.source.pool;
+      flags["network"] = saved.source.network;
+      console.log(`using the model's source: ${saved.label ?? saved.source.pool} on ${saved.source.network}`);
+    }
     if (!flags["timeframe"] && !flags["tf"]) flags["timeframe"] = saved.source.timeframe;
-    console.log(`using the model's source: ${saved.label ?? saved.source.pool} on ${saved.source.network}`);
+  } else if (!named && !saved.source) {
+    throw new Error(`${modelPath} records no source — pass --coin/--token/--pool/--csv to say what to predict on`);
   }
 
   const candles = await getCandles(flags);
@@ -656,6 +672,100 @@ async function cmdCeiling(f: Flags) {
   console.log("  hit it hardest. 'hold k bars' is the honest ceiling for a regime model, which");
   console.log("  is meant to make few durable calls. If that row is negative at your cost,");
   console.log("  stop modelling — the money is not there.");
+}
+
+/**
+ * The same walk-forward, run across the whole top-30 perp universe and every
+ * timeframe that can cover the window.
+ *
+ * A single backtest is one draw and this repo has already shown what one draw
+ * is worth here. A sweep buys breadth, and pays for it in multiple comparisons:
+ * 240 cells will produce a dozen p < 0.05 rows on pure noise. So the table is
+ * ranked on excess ROI over a rotated null at the same exposure — not on ROI,
+ * which mostly ranks which coins went up — and a row parked in the market more
+ * than 90% of the time cannot win its coin however good its return looks.
+ */
+async function cmdSweep(f: Flags) {
+  const coinsFlag = str(f, "coins");
+  const cfg: SweepConfig = {
+    coins: coinsFlag
+      ? coinsFlag.split(",").map((c) => c.trim().toUpperCase()).filter(Boolean)
+      : undefined,
+    limit: num(f, "limit", 30),
+    timeframes: str(f, "timeframes", DEFAULT_TIMEFRAMES.join(","))!
+      .split(",").map((t) => t.trim()).filter(Boolean),
+    days: num(f, "days", 45),
+    costBps: num(f, "cost", hl.HL_TAKER_BPS),
+    states: num(f, "states", 3),
+    trials: num(f, "trials", 200),
+    seed: num(f, "seed", 42),
+  };
+
+  // Everything below the table goes to stdout; progress goes to stderr, so
+  // piping the table into a file or a pager still works while it runs.
+  const started = Date.now();
+  const clock = (ms: number) => `${Math.floor(ms / 60_000)}m${String(Math.floor((ms % 60_000) / 1000)).padStart(2, "0")}s`;
+  const res = await sweep(cfg, (done, total, label) => {
+    const elapsed = Date.now() - started;
+    const eta = done > 0 ? (elapsed / done) * (total - done) : 0;
+    process.stderr.write(
+      `\r  [${String(done).padStart(3)}/${total}] ${label.padEnd(22)} ` +
+      `elapsed ${clock(elapsed)}  eta ${clock(eta)}   `,
+    );
+  });
+  process.stderr.write("\n");
+
+  const coins = [...new Set(res.rows.map((r) => r.coin))];
+  const winners = Object.values(res.best).sort((a, b) => b.excessRoi - a.excessRoi);
+
+  console.log(`\n${"=".repeat(104)}`);
+  console.log(
+    `TIMEFRAME SWEEP — ${coins.length} perp${coins.length === 1 ? "" : "s"} x ` +
+    `${cfg.timeframes!.length} timeframes x ${new Set(res.rows.map((r) => r.modelType)).size} models, ` +
+    `${res.days} days, ${res.costBps}bps per side, ranked by excess ROI over the null`,
+  );
+  console.log("=".repeat(104));
+  console.log("   #  coin       tf     model   excess ROI       ROI   buy&hold   expos  trades  p-value   ceiling20");
+  winners.forEach((r, i) => {
+    console.log(
+      `  ${String(i + 1).padStart(2)}  ${r.coin.padEnd(9)} ${r.timeframe.padEnd(5)}  ${r.modelType.padEnd(5)}  ` +
+      `${pct(r.excessRoi).padStart(10)}  ${pct(r.roi).padStart(9)}  ${pct(r.buyHold).padStart(9)}  ` +
+      `${pct(r.exposure).padStart(6)}  ${String(r.trades).padStart(6)}   ${r.pValue.toFixed(3)}  ` +
+      `${pct(r.ceilingHold20).padStart(10)}`,
+    );
+  });
+
+  const losers = coins.filter((c) => !res.best[c]);
+  console.log(`\n  ${winners.length}/${coins.length} coins produced a qualifying row ` +
+    `(no skip, >= 3 trades, <= 90% exposure).`);
+  for (const c of losers) {
+    console.log(`    ${c.padEnd(9)} ${rejectionReason(res.rows.filter((r) => r.coin === c))}`);
+  }
+  const skipped = res.rows.filter((r) => r.skipped);
+  if (skipped.length > 0) {
+    console.log(`\n  ${skipped.length}/${res.rows.length} rows carry a skip note ` +
+      `(${[...new Set(skipped.map((r) => r.skipped!.replace(/\d+/g, "N")))].slice(0, 4).join("; ")}).`);
+  }
+
+  const out = str(f, "out", "models/sweep.json")!;
+  await Bun.write(out, JSON.stringify(res, null, 2));
+  console.log(`\n  ${res.rows.length} rows -> ${out}`);
+
+  if (bool(f, "save")) {
+    // Refit on the whole window: the point is something to predict with, not
+    // more evidence. Nothing about these fits is out-of-sample.
+    console.error(`  refitting ${winners.length} winners on their full window...`);
+    for (const r of winners) {
+      const path = await saveBestModel(r, str(f, "models-dir", "models")!, cfg.states);
+      console.log(`  ${r.coin.padEnd(9)} ${r.timeframe.padEnd(5)} ${r.modelType} -> ${path}`);
+    }
+    console.log(`\n  next:  bun run src/cli.ts predict --model ${winners[0] ? `models/${winners[0].coin.toLowerCase()}-${winners[0].timeframe}-${winners[0].modelType}.model.json` : "models/<coin>.model.json"} --cost ${res.costBps}`);
+  }
+
+  console.log(`\n  ${res.rows.length} tests ran. \`validate\` is calibrated for ONE test on ONE market,`);
+  console.log(`  so roughly ${(0.05 * res.rows.length).toFixed(0)} of these rows should show p < 0.05 with no edge present at all.`);
+  console.log("  Read excess ROI, not ROI: the second column mostly ranks which coins went up,");
+  console.log(`  and a winner picked out of ${res.rows.length} cells is a selection, not a finding.`);
 }
 
 /**
@@ -834,11 +944,18 @@ async function cmdAccount(f: Flags) {
  * signal itself — so the question becomes "what is the probability the expected
  * move clears the round trip", which is the one a trader actually has.
  *
- * Two engines answer it. Variational EM (default) optimizes a bound on the
- * evidence and reports i.i.d. draws from the fitted approximation; `--gibbs`
- * runs the sampler instead, which is slower and asymptotically exact. Run both
- * when a number is about to matter: mean-field variational intervals are known
- * to come out too narrow, and narrow is the direction that flatters a signal.
+ * Three engines answer it, all by the same conjugate priors on the same
+ * emissions. Variational EM (default) optimizes a bound on the evidence and
+ * reports i.i.d. draws from the fitted approximation. `--gibbs` runs the
+ * sampler instead, which is slower and asymptotically exact. `--hsmm` runs
+ * variational EM over an explicit-duration model, where the dwell time being
+ * integrated over is a learned distribution rather than the geometric law a
+ * transition diagonal implies — which matters here more than anywhere else in
+ * the repo, because the hold length multiplies the edge in the cost comparison.
+ *
+ * Run more than one when a number is about to matter: mean-field variational
+ * intervals are known to come out too narrow, and narrow is the direction that
+ * flatters a signal.
  */
 async function cmdPosterior(f: Flags) {
   const ds = await getDataSet(f);
@@ -850,8 +967,18 @@ async function cmdPosterior(f: Flags) {
   const costBps = num(f, "cost", hl.HL_TAKER_BPS);
   const roundTrip = (2 * costBps) / 10_000;
   const useGibbs = bool(f, "gibbs");
+  const semi = modelType(f) === "hsmm";
+  const maxDuration = num(f, "max-duration", 30);
   const kappa0 = num(f, "kappa0", DEFAULT_PRIORS.kappa0);
+  const alphaDur = num(f, "alpha-dur", DEFAULT_PRIORS.alphaDur);
   const draws = num(f, "draws", 4000);
+  const seed = num(f, "seed", 11);
+  const restarts = num(f, "restarts", 4);
+  const maxIter = num(f, "iterations", 300);
+
+  if (semi && useGibbs) {
+    throw new Error("--gibbs is Markov-only: the sampler has no duration model. Pass one of --hsmm or --gibbs, not both.");
+  }
 
   const fs = buildFeatures(ds.candles, featureCfg);
   const scaler = fitScaler(fs.X, fs.T, fs.D);
@@ -860,56 +987,85 @@ async function cmdPosterior(f: Flags) {
   // Let the ELBO pick K when asked. Only variational EM can do this — the
   // sampler has no comparable quantity, so --select-states forces the engine.
   let states = num(f, "states", 3);
-  let selection: ReturnType<typeof selectStates> | null = null;
   const selectSpec = str(f, "select-states");
   if (selectSpec !== undefined) {
     const candidates = String(selectSpec).split(",").map((x) => Number(x.trim())).filter((x) => x >= 2);
-    console.log(`\nSelecting the number of regimes by ELBO over K = ${candidates.join(", ")}`);
-    selection = selectStates(Z, fs.T, fs.D, candidates, {
-      seed: num(f, "seed", 11), priors: { kappa0 }, draws: 0,
-    });
+    console.log(`\nSelecting the number of regimes by ELBO over K = ${candidates.join(", ")}` +
+      (semi ? `  (semi-Markov, maxDuration ${maxDuration} held fixed so the bounds stay comparable)` : ""));
+    const sel = semi
+      ? selectStatesHsmm(Z, fs.T, fs.D, candidates, {
+          seed, maxDuration, priors: { kappa0, alphaDur }, draws: 0,
+        })
+      : selectStates(Z, fs.T, fs.D, candidates, { seed, priors: { kappa0 }, draws: 0 });
     console.log("    K    ELBO/bar    occupied states");
-    for (const row of selection.scores) {
-      const mark = row.states === selection.best.K ? "  <-" : "";
+    for (const row of sel.scores) {
+      const mark = row.states === sel.best.K ? "  <-" : "";
       console.log(`   ${String(row.states).padStart(2)}  ${row.elboPerBar.toFixed(5).padStart(10)}  ${String(row.occupied).padStart(10)}${mark}`);
     }
-    states = selection.best.K;
+    states = sel.best.K;
   }
 
-  // Warm-start from EM. The sampler mixes far better from a sensible
-  // segmentation; variational EM lands in the same place either way but gets
-  // there in a handful of iterations instead of a few dozen.
-  const em = fit(Z, fs.T, fs.D, { states, restarts: num(f, "restarts", 4), seed: num(f, "seed", 42) });
+  console.log(`\nPosterior for ${ds.label} — ${states} states, ${fs.T} bars` +
+    (semi ? `, semi-Markov (durations up to ${maxDuration} bars)` : ""));
 
-  console.log(`\nPosterior for ${ds.label} — ${states} states, ${fs.T} bars`);
+  // The three engines differ in what they fit and how the last bar's forecast
+  // is produced; everything after this block reads the same three variables.
   let res: PosteriorDraws;
-  if (useGibbs) {
-    const iterations = num(f, "iterations", 1200);
-    console.log(`  Gibbs: ${iterations} sweeps, ${num(f, "burn-in", Math.floor(iterations / 2))} burn-in, thin ${num(f, "thin", 3)}`);
-    console.log(`  prior kappa0 = ${kappa0} (shrinkage toward zero drift)\n`);
-    res = runMcmc(Z, fs.T, fs.D, {
-      states, iterations,
-      burnIn: num(f, "burn-in", Math.floor(iterations / 2)),
-      thin: num(f, "thin", 3),
-      seed: num(f, "seed", 11),
-      init: em.params,
-      priors: { kappa0 },
-    });
-  } else {
-    const vb = fitVb(Z, fs.T, fs.D, {
-      states, init: em.params, draws,
-      maxIter: num(f, "iterations", 300),
-      seed: num(f, "seed", 11),
-      priors: { kappa0 },
+  let emMu: Float64Array;
+  let nextState: number[];
+
+  if (semi) {
+    // Warm start from the maximum-likelihood HSMM, which itself warm-starts
+    // from an HMM — the duration pmf has maxDuration free parameters per state
+    // and lands badly from a cold start.
+    const emh = fitHsmm(Z, fs.T, fs.D, { states, maxDuration, restarts, seed: num(f, "seed", 42) });
+    const vb = fitVbHsmm(Z, fs.T, fs.D, {
+      states, maxDuration, init: emh.params, draws, maxIter, seed,
+      priors: { kappa0, alphaDur },
     });
     const pruned = Array.from(vb.occupancy).filter((n) => n <= 0.01 * fs.T).length;
-    console.log(`  variational EM: ELBO/bar ${(vb.elbo / fs.T).toFixed(5)} after ${vb.iterations} iterations` +
+    console.log(`  variational EM, semi-Markov: ELBO/bar ${(vb.elbo / fs.T).toFixed(5)} after ${vb.iterations} iterations` +
       ` (${vb.converged ? "converged" : "hit the iteration cap"}), ${draws} independent draws`);
     if (pruned > 0) {
       console.log(`  ${pruned} of ${states} states carry almost no occupancy — the data does not support them.`);
     }
-    console.log(`  prior kappa0 = ${kappa0} (shrinkage toward zero drift)\n`);
+    console.log(`  prior kappa0 = ${kappa0} (shrinkage toward zero drift), duration concentration ${alphaDur}\n`);
     res = vb;
+    emMu = emh.params.mu;
+    // The causal one-step-ahead forecast, run on the posterior mean parameters.
+    const fh = filterHsmm(Z, fs.T, vb.meanParams);
+    nextState = Array.from(fh.nextProb.subarray((fs.T - 1) * states, fs.T * states));
+  } else {
+    // Warm-start from EM. The sampler mixes far better from a sensible
+    // segmentation; variational EM lands in the same place either way but gets
+    // there in a handful of iterations instead of a few dozen.
+    const em = fit(Z, fs.T, fs.D, { states, restarts, seed: num(f, "seed", 42) });
+    if (useGibbs) {
+      const iterations = num(f, "iterations", 1200);
+      console.log(`  Gibbs: ${iterations} sweeps, ${num(f, "burn-in", Math.floor(iterations / 2))} burn-in, thin ${num(f, "thin", 3)}`);
+      console.log(`  prior kappa0 = ${kappa0} (shrinkage toward zero drift)\n`);
+      res = runMcmc(Z, fs.T, fs.D, {
+        states, iterations,
+        burnIn: num(f, "burn-in", Math.floor(iterations / 2)),
+        thin: num(f, "thin", 3),
+        seed,
+        init: em.params,
+        priors: { kappa0 },
+      });
+    } else {
+      const vb = fitVb(Z, fs.T, fs.D, { states, init: em.params, draws, maxIter, seed, priors: { kappa0 } });
+      const pruned = Array.from(vb.occupancy).filter((n) => n <= 0.01 * fs.T).length;
+      console.log(`  variational EM: ELBO/bar ${(vb.elbo / fs.T).toFixed(5)} after ${vb.iterations} iterations` +
+        ` (${vb.converged ? "converged" : "hit the iteration cap"}), ${draws} independent draws`);
+      if (pruned > 0) {
+        console.log(`  ${pruned} of ${states} states carry almost no occupancy — the data does not support them.`);
+      }
+      console.log(`  prior kappa0 = ${kappa0} (shrinkage toward zero drift)\n`);
+      res = vb;
+    }
+    emMu = em.params.mu;
+    const { alpha } = filter(Z, fs.T, em.params);
+    nextState = Array.from(predictNext(alpha, (fs.T - 1) * states, em.params));
   }
 
   const un = (v: number) => unscale(v, 0, scaler);
@@ -920,9 +1076,12 @@ async function cmdPosterior(f: Flags) {
   console.log("  state   EM point   posterior mean     90% credible interval    P(mu>0)   dwell");
   for (let k = 0; k < states; k++) {
     console.log(
-      `    ${k}    ${b(un(em.params.mu[k * fs.D])).padStart(8)}bps ${b(ints[k].mean).padStart(12)}bps  ` +
+      `    ${k}    ${b(un(emMu[k * fs.D])).padStart(8)}bps ${b(ints[k].mean).padStart(12)}bps  ` +
       `[${b(ints[k].lower).padStart(8)}, ${b(ints[k].upper).padStart(7)}]bps  ` +
       `${(ints[k].pPositive * 100).toFixed(0).padStart(5)}%  ${durs[k].median.toFixed(0).padStart(5)}b`);
+  }
+  if (semi) {
+    console.log("  dwell is the mean of each draw's own duration pmf, not 1/(1 - A_kk).");
   }
 
   const top = states - 1;
@@ -934,9 +1093,7 @@ async function cmdPosterior(f: Flags) {
   }
 
   // What the model would actually trade right now.
-  const { alpha } = filter(Z, fs.T, em.params);
-  const nx = predictNext(alpha, (fs.T - 1) * states, em.params);
-  const sig = posteriorSignal(res, Array.from(nx), un, roundTrip, 0.9);
+  const sig = posteriorSignal(res, nextState, un, roundTrip, 0.9);
   console.log(`\n  Signal at the last bar (blended over the state belief)`);
   console.log(`    per bar        median ${b(sig.perBar.median)}bps   90% CI [${b(sig.perBar.lower)}, ${b(sig.perBar.upper)}]bps`);
   console.log(`    x ${sig.medianHold.toFixed(1)} bars held  ->  ${b(sig.median)}bps   90% CI [${b(sig.lower)}, ${b(sig.upper)}]bps`);
@@ -946,7 +1103,12 @@ async function cmdPosterior(f: Flags) {
     ? "    => not worth taking: the posterior does not favour clearing costs."
     : "    => the posterior favours clearing costs.");
 
-  if (!useGibbs) {
+  if (semi) {
+    console.log("\n  These intervals come from a mean-field approximation, which is biased");
+    console.log("  toward being too narrow, and the semi-Markov model has no sampler to");
+    console.log("  check that against. Re-run without --hsmm and with --gibbs to see how");
+    console.log("  wide the exact posterior is on the Markov version of the same question.");
+  } else if (!useGibbs) {
     console.log("\n  These intervals come from a mean-field approximation, which is biased");
     console.log("  toward being too narrow. Re-run with --gibbs before acting on a marginal");
     console.log("  call; if the two disagree, believe the sampler.");
@@ -1242,9 +1404,12 @@ meme-hmm — a hidden Markov model for meme coin regimes
   bun run src/cli.ts account --coin SOL --equity 50 --leverage 2   dollar P&L
   bun run src/cli.ts trades   --token WIF              trade ledger + ROI by window
   bun run src/cli.ts posterior  --coin SOL             credible intervals on the edge
+  bun run src/cli.ts posterior  --coin SOL --hsmm      the same, with dwell inferred
   bun run src/cli.ts validate --token WIF              is it skill or exposure?
   bun run src/cli.ts ceiling  --token WIF              is there money to find?
+  bun run src/cli.ts sweep --limit 30 --save            every coin x timeframe, ranked
   bun run src/cli.ts demo                             synthetic walkthrough
+  bun run tui                                         fit / backtest / paper trade
 
 Model
   --model-type hmm    hmm (geometric dwell) or hsmm (learned durations)
@@ -1269,11 +1434,35 @@ Diagnostics
   --holds 1,5,20      ceiling: bars an oracle commits for
   --trials 1000       validate: number of shuffles
 
-Posterior (Bayesian HMM; variational EM by default)
+Sweep (top-N perps x timeframes x models, one table)
+  --limit 30          how many perps, by 24h notional volume
+  --coins BTC,ETH     override the universe entirely
+  --timeframes 15m,30m,1h,2h
+                      5m is absent on purpose: ~5000 retained candles is 17
+                      days, so it cannot cover a 45-day window. Ask for it and
+                      the row still runs, marked with what it actually reached.
+  --days 45           calendar window; train/test sizes scale to what that buys
+  --cost 4.5          per side, bps (Hyperliquid taker)
+  --states 3          hidden states per fit
+  --trials 200        permutation trials behind every p-value
+  --out models/sweep.json   full result, every row including the skipped ones
+  --save              refit each winner on its full window into models/
+  Ranked on excess ROI over a rotated null at the same exposure. A row above
+  90% exposure is buy & hold wearing a model and cannot win its coin; a row
+  under 3 trades is one coin flip. Progress prints to stderr so the table pipes.
+
+Posterior (Bayesian HMM or HSMM; variational EM by default)
   --select-states 2,3,4,5   pick the number of regimes by ELBO
   --draws 4000        independent draws from the variational posterior
   --iterations 300    cap on variational EM iterations
   --kappa0 0.5        prior strength pulling state means toward zero drift
+  --hsmm              put the priors on an explicit-duration model instead, so
+                      the dwell the edge is multiplied by is inferred rather
+                      than read off a transition diagonal. --max-duration
+                      applies; --gibbs does not.
+  --alpha-dur 0.05    --hsmm: Dirichlet concentration per duration bin. Raise it
+                      if the learned pmf comes out spikier than the sample
+                      supports.
   --gibbs             use the sampler instead. Slower, asymptotically exact,
                       and the thing to check a marginal call against — mean-field
                       credible intervals come out too narrow.
@@ -1357,6 +1546,7 @@ try {
   else if (cmd === "fetch") await cmdFetch(flags);
   else if (cmd === "validate") await cmdValidate(flags);
   else if (cmd === "ceiling") await cmdCeiling(flags);
+  else if (cmd === "sweep") await cmdSweep(flags);
   else if (cmd === "top") await cmdTop(flags);
   else if (cmd === "trades") await cmdTrades(flags);
   else if (cmd === "confluence") await cmdConfluence(flags);
