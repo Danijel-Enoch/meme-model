@@ -19,7 +19,7 @@ machinery that establishes that rather than hiding it. See [Results](#results).
 ```bash
 bun install
 bun run demo      # synthetic end-to-end walkthrough
-bun test          # 146 tests, incl. brute-force validation of both models
+bun test          # 418 tests, incl. brute-force validation of both models
 ```
 
 Hyperliquid perps — clean data, 4.5bps taker, no API key:
@@ -546,9 +546,114 @@ This is a selection out of 240 attempts, not a finding, and treating the top of
 it as a shortlist is exactly the procedure this repo measured at a rank
 correlation of 0.033 across halves.
 
+## What the sweep's p-value actually was
+
+The sweep table above reports a best cell at p = 0.035. That number is the
+minimum of 228 dependent draws, and the correct way to price a minimum is the
+data-snooping literature.
+
+`src/spa.ts` implements Hansen's (2005) **SPA test** with the Politis-Romano
+stationary bootstrap and Politis-White automatic block length, White's (2000)
+**Reality Check**, **Romano-Wolf** (2005) stepdown, and the **deflated Sharpe
+ratio** of Bailey & Lopez de Prado (2014). All 228 cells are refit and aligned
+on a common clock, and one set of bootstrap index vectors is shared across every
+cell so the cross-sectional dependence is resampled rather than assumed away.
+
+```
+SPA (Hansen), consistent p      0.340   bracket [0.299, 0.340]
+Reality Check (White)           0.483
+Romano-Wolf at 5%               nothing survives
+deflated Sharpe of the winner   0.400
+```
+
+The winner, NEAR/30m/hmm, has t = 2.47 and a naive one-sided p of 0.0067.
+**Accounting for the 228 cells that were tried, its p-value is 0.34.** Its
+per-bar Sharpe of 0.134 sits *below* SR0 = 0.150, the expected maximum Sharpe
+under no skill anywhere. Bonferroni, Holm and BHY all leave zero survivors, and
+the largest t-statistic in the entire sweep is short of the t > 3.0 that Harvey,
+Liu & Zhu (2016) argue any finance claim should clear.
+
+Under a pure null the expected minimum of 228 p-values is about 1/229 = 0.004.
+The observed 0.035 is *less* extreme than chance predicts.
+
+## The study was never powered
+
+`src/power.ts` asks the question that belongs before a search rather than after
+it: given an edge of the size this model claims, how much data does it take to
+tell it from nothing? The answer explains every result above.
+
+```
+power to detect the model's own 4.2bps/bar edge, 45 days at 30m   19%
+                                 ...at the sweep's corrected alpha   0%
+smallest edge that window can resolve                        11.6bps/bar
+```
+
+**The sweep had zero power.** Two hundred and forty cells, none of which could
+have detected the effect even if it were real and exactly as large as the
+posterior says. Its p-values were noise by construction.
+
+Two things make it worse than it looks. The repo's `validate` defaults to 1000
+permutation draws, whose floor of 1e-3 is coarser than the 2.1e-4 threshold 240
+tests demand — the test cannot express the answer it is being asked for. And
+pooling coins buys far less than it appears to:
+
+```
+average pairwise return correlation across 29 perps   rho = 0.431
+effective independent series (Kish)                   2.22  (of 29)
+ceiling as coins -> infinity                          3.32
+```
+
+Thirty perps is not thirty experiments. It is 2.2, and no number of additional
+coins ever gets past 3.3 — this market is one factor observed many times.
+
+The binding constraint turns out to be calendar time, not bar count. Required
+Sharpe depends only on span, so the same 5000-bar API cap is worth far more at a
+slower interval:
+
+```
+30m  2160 bars =  45 days   detectable annual Sharpe 7.08
+ 1h  5000 bars = 208 days                            3.29
+ 2h  5000 bars = 417 days                            2.33
+ 4h  5000 bars = 582 days                            1.97
+                     model's own implied Sharpe:     3.11
+```
+
+## The test that could actually answer it
+
+`src/panel.ts` applies ONE pre-specified configuration to every coin and pools
+the result — one hypothesis on 74,603 observations instead of 240 hypotheses on
+1000 each, with nothing selected and therefore nothing to correct for.
+
+The null rotates **the whole market together** rather than each coin
+separately. Rotating independently destroys the cross-sectional dependence,
+which collapses the null's variance and manufactures significance out of beta;
+`panel.test.ts` pins that failure mode at more than 2x too tight on synthetic
+market-factor data.
+
+At 4h over 582 days, where the test has ~100% power to detect the Sharpe the
+model claims:
+
+```
+27 coins, 74,603 observations
+actual   0.262 bps/bar   null median -0.151   90% band [-0.882, 0.564]
+p-value  0.1808
+forecast IC 0.00287 at h=1 (p 0.40),  0.01064 at h=9 (p 0.32)
+```
+
+**This is a null result with teeth.** An edge of the claimed size would have
+been seen and was not. What survives is an edge no larger than about 1.5bps/bar
+in 30m terms — against a 0.9bps/bar break-even after costs. Resolving whether
+*that* exists needs 2.6 years of history; Hyperliquid retains 1.6.
+
+`research/tests.jsonl` records every hypothesis run against this data, each
+written down before its result, with a running family count. One candidate did
+appear — a negative rank IC at all six horizons, best p = 0.011 — and it died on
+a pre-registered held-out window at p = 0.265, with the sign flipping outright.
+That is what the registry is for.
+
 ## Tests
 
-`bun test` — 146 tests. Both models are validated against brute-force
+`bun test` — 418 tests. Both models are validated against brute-force
 enumeration: all `K^T` state paths for the HMM, and every (state, duration)
 segmentation for the HSMM. Forward log-likelihood, filtered marginals, smoothed
 marginals and the Viterbi path must match exactly. Plus EM monotonicity,
@@ -602,6 +707,12 @@ src/charts.ts       braille line charts, candlesticks, regime strips, axes
 src/tui/            the terminal: model.ts (state + key map), app.ts (layout),
                     worker.ts (all compute, off the render thread),
                     live.ts (closed-bar polling), store.ts (disk), index.ts
+src/panel.ts        one hypothesis over every coin at once, with a null that
+                    rotates the whole market together so beta stays in it
+src/power.ts        how much data an edge of a given size needs, and what the
+                    window on hand can resolve. Read this before searching
+src/spa.ts          Hansen SPA, White Reality Check, Romano-Wolf, deflated
+                    Sharpe — the correct p-value for a searched-over table
 src/cli.ts          all commands
 ```
 

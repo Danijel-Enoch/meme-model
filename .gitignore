@@ -28,3 +28,7 @@ build/
 
 # sweep output: fitted models and the ranked table
 models/
+
+# panel / spa caches (regenerate with src/panel.ts, src/spa.ts)
+models/panel-*.json
+models/spa-series.json
