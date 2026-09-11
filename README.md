@@ -690,10 +690,59 @@ smallest edge that window can resolve                        11.6bps/bar
 have detected the effect even if it were real and exactly as large as the
 posterior says. Its p-values were noise by construction.
 
-Two things make it worse than it looks. The repo's `validate` defaults to 1000
-permutation draws, whose floor of 1e-3 is coarser than the 2.1e-4 threshold 240
-tests demand — the test cannot express the answer it is being asked for. And
-pooling coins buys far less than it appears to:
+The whole analysis collapses to one identity, and it is worth memorising:
+
+```
+required true annual Sharpe  =  (z_alpha + z_beta) / sqrt(years of data)
+```
+
+Edge, volatility, bar length, hold and exposure all cancel. **45 days is 0.123
+years, so you need a true annualized Sharpe of 7.08** before p < 0.05 is more
+likely than not. That is why sweeping four timeframes buys nothing: 45 days is
+45 days whether you slice it into 2160 bars or 540.
+
+```
+45 days     needs true annual Sharpe 7.08
+582 days                             1.97
+1 year                               2.49
+6.2 years                            1.00     <- what a genuinely good strategy needs
+```
+
+Three things make it worse than it already looks.
+
+**The test the repo actually runs has less power than the arithmetic above.**
+The analytics describe a t-test; `validate` and `sweep` run a rotation
+permutation test, and a rotated position series is in the market just as often
+as the real one — so it collects `exposure` of the edge *for the null*, and the
+test only ever sees the remainder. Simulated head-to-head at the 4.2bps
+posterior:
+
+```
+exposure   analytic   simulated   ratio
+  0.10      0.129      0.140      1.09
+  0.35      0.244      0.155      0.63
+  0.65      0.363      0.225      0.62
+  0.90      0.451      0.145      0.32
+```
+
+At 90% exposure the test retains under a third of its nominal power. This is an
+independent derivation of the >90% exposure veto in `sweep.ts` — that rule was
+written to stop buy-and-hold winning, and it turns out to also mark the point
+where the test stops being able to see anything at all.
+
+**The sweep could not have expressed its own threshold.** `sweep.ts` runs 200
+permutation draws, so every p-value in `models/sweep.json` is a multiple of
+0.005. The smallest number it can print is 0.005; Bonferroni over 240 cells asks
+for 0.000208. It needs ~4,800 draws for the grid to contain the threshold at all
+and ~48,000 for the tail count to be an estimate rather than one or two hits.
+
+**And the turnover is off the scale the cost literature works on.** At 30m with
+65% exposure and a 10-bar hold this strategy does ~94 round trips a month —
+**9,360% one-sided monthly turnover**. Novy-Marx & Velikov (2016) find that
+equity anomalies below 50% monthly turnover keep their significance after costs
+and few above it do. This runs at **187x that line**.
+
+Pooling coins also buys far less than it appears to:
 
 ```
 average pairwise return correlation across 29 perps   rho = 0.431
@@ -871,6 +920,10 @@ Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
   74% on the majors. The default remains Gaussian because every result in this
   README was produced with it; read the Student-t section before believing any
   edge figure here.
+- Regime-switching models are known to identify regimes well in sample and
+  forecast them poorly out of it — Dacco & Satchell (1999), "Why do
+  regime-switching models forecast so badly?", is the canonical statement, and
+  everything in the Results section is consistent with it.
 - The signal is a point estimate everywhere except `posterior`. If you build on
   this, gate on `P(edge x hold > round trip)` rather than on the plugged-in
   mean — and remember that clearing the hurdle in expectation says nothing about
