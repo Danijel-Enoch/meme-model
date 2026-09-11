@@ -356,11 +356,109 @@ ELBO -3.767  -3.574  -3.428  -3.352  -3.292  -3.299  -3.318  -3.364
 occ      2       3       4       5       6       7       7       7
 ```
 
-Read that as a statement about Gaussian emissions, not about markets. A single
-heavy-tailed return distribution is cheaper to approximate with several
-Gaussians than with one, so extra states buy likelihood by modelling the tails
-rather than by finding regimes. The repo defaults to 3 because three states are
-interpretable — chop, bleed, pump — not because the evidence prefers them.
+The obvious reading is that this is a statement about Gaussian emissions rather
+than about markets: a single heavy-tailed return distribution is cheaper to
+approximate with several Gaussians than with one, so extra states buy likelihood
+by modelling the tails rather than by finding regimes.
+
+**That reading is too strong, and `src/student.ts` is what disproves it.**
+Held-out log-likelihood — an honest out-of-sample measure, not a bound — keeps
+improving through K = 5 for Student-t emissions just as it does for Gaussian
+ones, on every coin tested. If the extra states were purely absorbing kurtosis,
+giving the model a distribution that handles kurtosis natively would have made
+them redundant. It does not. The extra states are buying something real about
+the density.
+
+What that does NOT mean is that they are buying anything tradeable. Forecasting
+a distribution well and forecasting its mean well are different problems, and
+only the second one has a P&L. See the section below.
+
+The repo defaults to 3 because three states are interpretable — chop, bleed,
+pump — not because the evidence prefers them.
+
+## Gaussian emissions were overstating the edge
+
+`src/student.ts` fits the same models with Student-t emissions: the scale
+mixture of normals, an EM whose E step computes the latent precision weight
+u = (nu + p) / (nu + delta) and whose M step is the Peel & McLachlan (2000)
+update, with nu itself estimated by the ECME root-find of Liu & Rubin (1995).
+
+It fits better. Held-out log-likelihood per bar, 30m, trained on two thirds and
+scored on the remaining third, across six perps and K = 2..5: **t wins 18 of 24
+cells.** Dwell lengthens too, which is Bulla's (2011) persistence result showing
+up — BTC's bullish state goes from 8.1 bars to 12.1.
+
+The part that matters is what happens to the means:
+
+```
+coin      gaussian means      bull dwell    student-t means     bull dwell   nu
+BTC      -0.4, 0.3, 4.3          8.1b      -0.1, 0.4, 1.1         12.1b   200,11,6
+ETH       0.4, 0.7, 3.1          7.8b       0.3, 0.8, 0.9          8.0b   45,5,200
+SOL      -0.1, 0.6, 3.4         10.1b      -0.0, 0.6, 2.2         10.1b   200,21,6
+HYPE     -0.2, 0.6, 1.6          6.8b      -0.4, 0.6, 1.3          6.5b   7,42,200
+XRP      -1.7, 0.4, 7.6         13.4b      -1.7, 0.4, 7.6         13.7b   200,29,6
+DOGE      0.3, 0.4, 1.5          9.3b       0.1, 0.7, 1.6         11.4b   35,200,5
+```
+
+On the majors the bullish state's mean collapses — **BTC 4.3 to 1.1 bps/bar,
+ETH 3.1 to 0.9**. That is what a robust estimator is for. The Gaussian fit's
+headline edge was being carried by a handful of extreme bars; down-weight them
+correctly and most of it is not there.
+
+**Two independent methods now agree on the number.** The 582-day panel test put
+an upper bound of about 1.5bps/bar on any edge, at ~100% power. The Student-t
+fit, which knows nothing about that test, estimates the bullish state at
+0.9-2.2bps/bar on the liquid coins. The 4.2bps/bar figure this repo was built
+around was substantially an artifact of Gaussian emissions meeting fat tails.
+
+Against a 0.9bps/bar break-even after costs, that is an edge worth perhaps 1.5x
+its cost rather than the 4.7x the old fit implied — which is not nothing, and is
+nowhere near enough to survive a 44% win rate.
+
+### What the degrees of freedom are telling you
+
+Read the nu column again. Every coin shows the same shape: **one state at
+nu = 5-11, and at least one pinned at 200**, the upper bound, which is
+numerically Gaussian. The data does not want heavy tails everywhere. It wants
+exactly one violent regime with them and ordinary ones elsewhere.
+
+That is Bulla's hybrid `M_Nt`, and in his S&P 500 study it beat the all-Gaussian
+model in 9 of 10 periods while the all-t model beat *it* in only 5 of 10. It is
+also cheaper: one nu instead of K.
+
+### So should the model have more parameters?
+
+No — and the arithmetic is not close:
+
+```
+model                  params  bars@30m/45d  obs/param
+HMM  K=3                   26          2160         83
+HSMM K=3 maxDur=30        113          2160         19
+HMM  K=5                   54          2160         40
+HSMM K=5 maxDur=30        199          2160         11
+HSMM K=6 maxDur=60        425          2160          5
+```
+
+Detection needs n proportional to (sigma/mu)^2. More states do not create edge;
+they split the same bars into smaller pieces, so each state's mean is estimated
+from less data and the ratio gets worse. 87 of the HSMM's 113 parameters are the
+non-parametric duration pmf — 29 free numbers per state to describe what is
+probably a negative binomial with two.
+
+And there is a ceiling no parameter count reaches. Ryden, Terasvirta and Asbrink
+(1998), on this exact model class: *"the HMM can only produce series with
+exponentially decaying autocorrelation functions. As for TP2, the model thus
+seems doomed from the start."* A K-state chain's absolute-return autocorrelation
+is a sum of at most K-1 geometric modes; real returns decay far slower than any
+of them. That is a wrong-family problem, not a too-few-parameters problem, and
+it is why `src/hsmm.ts` exists at all.
+
+The moves that remain, in order of how much they can change the answer:
+a hybrid emission with one t-state; a parametric duration (113 parameters down
+to 32); and `src/flow.ts` — funding, open interest and taker flow — which is the
+only one of the three that adds information rather than redistributing it. The
+power analysis sets its bar: better than ~1.5bps/bar, or it will not be visible
+in anything Hyperliquid retains.
 
 ## Account simulation
 
@@ -707,6 +805,10 @@ src/charts.ts       braille line charts, candlesticks, regime strips, axes
 src/tui/            the terminal: model.ts (state + key map), app.ts (layout),
                     worker.ts (all compute, off the render thread),
                     live.ts (closed-bar polling), store.ts (disk), index.ts
+src/student.ts      Student-t emissions: scale-mixture EM, ECME for nu, and the
+                    finding that Gaussian fits were inflating the state means
+src/flow.ts         funding, open interest and taker flow — the only features
+                    here that are not a function of past price
 src/panel.ts        one hypothesis over every coin at once, with a null that
                     rotates the whole market together so beta stays in it
 src/power.ts        how much data an edge of a given size needs, and what the
@@ -763,9 +865,12 @@ Walkfwd     --train 1500  --test 500  --bars-per-year <n>  --verbose
 
 ## Limits worth knowing
 
-- Gaussian emissions understate crypto tails. The features are chosen to be as
-  close to Gaussian as possible (log vol rather than vol), but a genuine 40%
-  candle is far outside what the model thinks can happen.
+- Gaussian emissions understate crypto tails, and the cost is not only a worse
+  fit: they inflate the state means the signal trades on. `src/student.ts` fits
+  the same models with Student-t emissions and the bullish mean falls by up to
+  74% on the majors. The default remains Gaussian because every result in this
+  README was produced with it; read the Student-t section before believing any
+  edge figure here.
 - The signal is a point estimate everywhere except `posterior`. If you build on
   this, gate on `P(edge x hold > round trip)` rather than on the plugged-in
   mean — and remember that clearing the hurdle in expectation says nothing about
