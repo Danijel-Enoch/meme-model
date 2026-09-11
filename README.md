@@ -798,6 +798,72 @@ appear — a negative rank IC at all six horizons, best p = 0.011 — and it die
 a pre-registered held-out window at p = 0.265, with the sign flipping outright.
 That is what the registry is for.
 
+## What the literature actually supports
+
+A survey of the peer-reviewed record on Markov-switching regime signals, with
+each paper checked for two things the abstracts rarely mention: whether it costs
+its trades, and whether its evaluation is genuinely out of sample.
+
+**The headline is an absence.** No peer-reviewed paper was found that applies an
+HMM or Markov-switching regime signal to crypto trading with realistic
+transaction costs under a true walk-forward protocol. The crypto HMM literature
+that is peer-reviewed — Giudici & Abu Hashish (2020), Koki, Leonardos & Piliouras
+(2020, 2022), Figà-Talamanca et al. (2021), Cortese, Kolm & Lindström (2023) — is
+descriptive or density-forecasting. Koki et al. (2022) is the one most often
+cited as evidence crypto regimes are tradable; its evaluation is predictive
+density against a random walk, with no strategy and no P&L.
+
+Suda & Spiteri (2019) is the most-cited crypto paper that does simulate trading,
+with four-state HSMMs and expanding-window Viterbi decoding, reporting roughly
+double buy-and-hold on BTC. Its own text: *"the actions (buy or sell) are not
+subject to transaction costs."* The test window is a single two-year period
+straddling the 2017 bubble and the 2018 crash — the most favourable imaginable
+window for a crash-avoidance rule — and four thresholds were tried with the best
+marked in bold and no multiple-testing adjustment.
+
+**Where the support is real, it is for risk reduction, not alpha.** The two
+best-designed positive studies both cost their trades at 10bp and both clear
+their hurdle:
+
+- Bulla et al. (2011), "Markov-switching asset allocation: Do profitable
+  strategies exist?" — rolling 2000-observation window, Viterbi paths, a median
+  filter over past observations only. Net of costs the S&P 500 strategy returns
+  8.56% against the index's 8.37%: **an excess of 18.5 basis points per year.**
+  On the Nikkei it is still negative, merely less so. Average volatility
+  reduction 41%.
+- Nystrup et al. (2018), "Dynamic portfolio optimization across hidden market
+  regimes" — online HMM estimation, a one-day execution delay. Sharpe 0.56
+  against the index's 0.30. The authors' own caveat: *"the outperformance
+  relative to the index comes from the two major downturns"* — and on the FTSE
+  the strategy loses to buy-and-hold on both return and Sharpe.
+
+Both rest on single samples containing 2000-02 and 2008, and both tune
+hyperparameters with full-sample knowledge. Apply the Harvey & Liu (2015)
+haircut for the number of trials and little survives.
+
+**The theory predicted this.** Dacco & Satchell (1999), "Why do regime-switching
+models forecast so badly?", shows that even when the regime-switching model IS
+the true data-generating process, a small regime-misclassification rate destroys
+its MSE advantage — the true model can lose to a random walk. Engel (1994) found
+exactly that empirically in FX: good in-sample fit across 18 exchange rates, no
+out-of-sample gain over a random walk. And Hamilton (2011), on his own model,
+warns that real-time turning-point detection "is a bigger challenge than many
+academics might assume" — the crisp regime chart in a paper is a smoothed,
+revised, full-sample object no real-time trader ever had.
+
+**One result points somewhere else.** Shu, Yu & Mulvey (2024) is among the few
+properly-costed protocols, with the jump penalty chosen by time-series
+cross-validation rather than hindsight — and its headline comparison is that a
+**statistical jump model beats the HMM**. That suggests the useful ingredient is
+a regime-persistence penalty rather than the Markov machinery, which is worth
+more than another timeframe sweep.
+
+So the defensible claim, and it is the one this repo's own numbers arrived at
+independently: HMM regime detection has credible published support as a
+**risk-management overlay** that reduces volatility and drawdown net of
+institutional costs, and essentially none as a source of after-cost trading
+profit — least of all in crypto, at retail timeframes, against a 9bp round trip.
+
 ## Tests
 
 `bun test` — 418 tests. Both models are validated against brute-force
