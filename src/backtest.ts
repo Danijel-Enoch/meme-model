@@ -13,9 +13,10 @@
 
 import { fit, filter, predictNext, expectedDuration, type HmmParams } from "./hmm";
 import { fitHsmm, filterHsmm, expectedDurations, type HsmmParams } from "./hsmm";
+import { fitJump, classifyOnline, jumpToParams, type JumpModelParams } from "./jump";
 import { buildFeatures, fitScaler, applyScaler, unscale, type Candle, type FeatureSet, type Scaler, type FeatureConfig } from "./features";
 
-export type ModelType = "hmm" | "hsmm";
+export type ModelType = "hmm" | "hsmm" | "jump";
 
 export interface StrategyConfig {
   /**
@@ -52,6 +53,8 @@ export interface StrategyConfig {
 
 export interface WalkForwardConfig {
   modelType?: ModelType;
+  /** Jump model only: the price of one regime switch. Higher means fewer. */
+  lambda?: number;
   /** HSMM only: longest dwell time the duration pmf can represent. */
   maxDuration?: number;
   trainSize?: number;
@@ -140,6 +143,28 @@ function describeModel(
   const meanReturns = stateMeanReturns(params as HmmParams, scaler);
   const vols = stateVols(params, scaler, names);
 
+  if (modelType === "jump") {
+    // No transition law, by construction. The forecast for the next bar is the
+    // state the online rule assigns to this one — a jump model's entire claim is
+    // that regimes persist, and inventing a transition matrix to predict leaving
+    // one would smuggle the Markov machinery back in.
+    const p = params as unknown as JumpModelParams;
+    return {
+      K: p.K, params, meanReturns, vols,
+      durations: Array.from({ length: p.K }, (_, k) => {
+        const stay = Math.min(p.A[k * p.K + k], 1 - 1e-9);
+        return 1 / (1 - stay);
+      }),
+      predict: (Z, len) => {
+        const path = classifyOnline(Z, len, { K: p.K, D: p.D, centroids: p.centroids, lambda: p.lambda });
+        const stateProb = new Float64Array(len * p.K);
+        for (let t = 0; t < len; t++) stateProb[t * p.K + path[t]] = 1;
+        // nextProb === stateProb: persistence is the whole forecast.
+        return { stateProb, nextProb: stateProb.slice() };
+      },
+    };
+  }
+
   if (modelType === "hsmm") {
     const p = params as HsmmParams;
     return {
@@ -215,6 +240,21 @@ function fitModel(
 ): FittedModel {
   const seed = (wf.seed ?? 42) + refits;
   const states = wf.states ?? 3;
+
+  if ((wf.modelType ?? "hmm") === "jump") {
+    const res = fitJump(trainZ, n, D, {
+      states, seed, lambda: wf.lambda ?? 1, restarts: wf.restarts ?? 8,
+    });
+    const p = jumpToParams(trainZ, n, D, res);
+    return {
+      // Not a log-likelihood — the jump model has none. The negated objective
+      // is reported in its slot so the walk-forward's verbose trace still
+      // prints something monotone and comparable ACROSS lambdas, and across
+      // nothing else.
+      logLik: -res.objective,
+      ...describeModel(p as unknown as HmmParams, "jump", scaler, names),
+    };
+  }
 
   if ((wf.modelType ?? "hmm") === "hsmm") {
     const res = fitHsmm(trainZ, n, D, {

@@ -82,6 +82,8 @@ export interface PanelConfig {
   states?: number;
   modelType?: ModelType;
   maxDuration?: number;
+  /** Jump model only: the price of one regime switch. */
+  lambda?: number;
   seed?: number;
 }
 
@@ -492,7 +494,7 @@ export async function collectPanel(
       if (!sizes.fits) continue;
 
       const res = walkForward(candles, FEATURES, strategy, {
-        modelType, states, maxDuration: cfg.maxDuration ?? 30,
+        modelType, states, maxDuration: cfg.maxDuration ?? 30, lambda: cfg.lambda,
         trainSize: sizes.trainSize, testSize: sizes.testSize,
         seed: cfg.seed ?? 42, restarts: 4,
         barsPerYear: hl.hlBarsPerYear(timeframe),

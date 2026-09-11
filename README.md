@@ -798,6 +798,85 @@ appear — a negative rank IC at all six horizons, best p = 0.011 — and it die
 a pre-registered held-out window at p = 0.265, with the sign flipping outright.
 That is what the registry is for.
 
+## A jump model instead of a Markov chain
+
+Shu, Yu & Mulvey (2024) is one of the few properly costed protocols in this
+literature, and its headline is that a **statistical jump model beats an HMM** —
+which suggests the useful ingredient is a persistence penalty rather than the
+Markov machinery. `src/jump.ts` implements it.
+
+```
+minimise   sum_t ||z_t - theta_{s_t}||^2  +  lambda * #{t : s_t != s_{t-1}}
+```
+
+No transition matrix, no emission density, no duration pmf. Persistence is one
+number. Three states over three features costs 9 parameters plus lambda, against
+26 for the Gaussian HMM and 113 for the HSMM.
+
+Two implementation points that are easy to get wrong, and that this repo did get
+wrong first:
+
+**The online rule carries an arrival cost, not the previous label.** Shu et al.
+reject the shortcut explicitly — "a basic k-means style online inference ...
+ignores temporal information". The correct rule is the forward pass of the same
+dynamic program, read row by row:
+`V[t][k] = L[t][k] + min_j(V[t-1][j] + lambda*[j != k])`, `s_t = argmin_k V[t][k]`.
+It is causal by construction. Measured against known regimes, the naive rule is
+actually MORE accurate at moderate penalties (.9285 vs .8660 at lambda 5) and
+then collapses at large ones (.7070 vs .9075 at lambda 20), because under the
+shortcut a single bar must overcome lambda by itself, so past some penalty the
+path stops moving. The arrival cost integrates evidence across bars. That matters
+here specifically: the whole reason to reach for a jump model is turnover
+control, which means running lambda high — exactly where the shortcut fails.
+
+**The penalty does not make it robust to outliers.** A lone spike is worth its
+magnitude SQUARED to capture while the penalty costs lambda, so no penalty
+absorbs a 25-sigma bar before flattening the real regimes: with one 40-sigma bar
+in 400, occupancy runs 201/198/1 at lambda 0 and still 200/199/1 at lambda 800.
+Clip the features first — the authors' reference implementation does, at 3
+sigma, though the papers do not mention it.
+
+### What it did here
+
+Same features, same walk-forward, same 4h/582-day panel as the HSMM, with lambda
+fixed in advance by a rule from the cost literature rather than from returns: the
+smallest value whose median turnover falls under the 50% monthly line where
+Novy-Marx & Velikov find anomalies stop surviving costs.
+
+```
+lambda  med trades  monthly turnover  exposure  med dwell   pooled bps      p
+     1         490             1423%       47%      5.5b        0.067   0.128
+     2         352             1033%       35%      6.9b       -0.273   0.463
+     4         171              557%       24%      8.0b       -0.074   0.449
+     8          87              260%       21%     13.9b       -0.060   0.590
+    16          38              115%       26%     38.9b        0.721   0.084
+    32          16               51%       33%     90.7b        0.491   0.378
+    64           6               16%       33%      0.067       0.067   0.564
+                                                  (HSMM baseline: 706%, p = 0.181)
+```
+
+**The mechanism worked and the conclusion did not move.** Turnover fell 89-fold,
+from 1423% to 16% monthly, with dwell going from 5.5 bars to 203 — precisely
+what the jump penalty is advertised to do, and what a transition matrix
+structurally cannot match (Shu's own Table 3: an HMM median-filtered at k=20,
+costing ten days of signal latency, still switches twice a year, while lambda=5
+gets there immediately). The p-value was flat across all of it. The
+pre-registered lambda=64 gives p = 0.570; the best of the seven exploratory looks
+is 0.084 against a Bonferroni bar of 0.0071.
+
+That is an answer to the question the literature leaves open. Nystrup and Shu
+both attribute the jump model's edge to persistence and lower turnover, but
+neither decomposes it — there is no matched-turnover comparison and no zero-cost
+counterfactual anywhere in the field. Here the decomposition is forced, because
+turnover moved two orders of magnitude while the signal did not move at all:
+**the jump model's advantage is a cost-efficiency mechanism, and cost efficiency
+cannot manufacture an edge that is not there.** Test 6 had already ruled out an
+edge of the claimed size at ~100% power. Trading it more cheaply does not change
+that.
+
+Where it would matter is a market with a real edge being eaten by costs — which
+is what Shu measured on the S&P 500, and is not what this data is.
+
 ## What the literature actually supports
 
 A survey of the peer-reviewed record on Markov-switching regime signals, with
@@ -920,6 +999,8 @@ src/charts.ts       braille line charts, candlesticks, regime strips, axes
 src/tui/            the terminal: model.ts (state + key map), app.ts (layout),
                     worker.ts (all compute, off the render thread),
                     live.ts (closed-bar polling), store.ts (disk), index.ts
+src/jump.ts         statistical jump model: regimes by penalised clustering,
+                    no Markov chain. lambda is a direct dial on turnover
 src/student.ts      Student-t emissions: scale-mixture EM, ECME for nu, and the
                     finding that Gaussian fits were inflating the state means
 src/flow.ts         funding, open interest and taker flow — the only features
